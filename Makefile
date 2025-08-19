@@ -14,7 +14,7 @@ openapi-snapshot:
 	@echo "Wrote docs/api/ai/openapi.json"
 
 openapi-lint:
-	$(SPECTRAL) lint docs/api/ai/openapi.json
+	$(SPECTRAL) lint --ruleset docs/api/.spectral.yaml docs/api/ai/openapi.json
 
 redoc-build:
 	$(REDOCLY) build-docs docs/api/ai/openapi.json -o docs/api/ai/reference.html
