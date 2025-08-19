@@ -29,6 +29,14 @@ app.add_middleware(RequestIdMiddleware)
 
 logger = logging.getLogger("coach_up.ai.chat")
 
+# Rubric v1 categories (normalized [0,1])
+RUBRIC_V1_CATEGORIES = [
+    "correctness",
+    "clarity",
+    "conciseness",
+    "fluency",
+]
+
 
 @app.get("/health", tags=["meta"], description="Liveness endpoint for health checks.")
 async def health():
@@ -113,7 +121,27 @@ async def _run_assessment_job(session_id: str, group_id: str, request_id: Option
             )
         )
         # Simulate rubric evaluation work
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
+        # Produce deterministic-ish scores in [0,1] using hash of ids
+        base = abs(hash((session_id, group_id))) % 1000
+        scores = {}
+        for i, cat in enumerate(RUBRIC_V1_CATEGORIES):
+            scores[cat] = round(((base + (i * 73)) % 1000) / 1000.0, 2)
+        try:
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "assessments_scores",
+                        "requestId": request_id,
+                        "sessionId": session_id,
+                        "groupId": group_id,
+                        "rubricVersion": rubric_version,
+                        "scores": scores,
+                    }
+                )
+            )
+        except Exception:
+            pass
     finally:
         total_s = time.perf_counter() - start
         try:
@@ -160,6 +188,7 @@ async def assessments_get(sessionId: str):
             "highlights": ["placeholder"],
             "recommendations": ["placeholder"],
             "rubricVersion": "v1",
+            "categories": RUBRIC_V1_CATEGORIES,
         },
     }
 
