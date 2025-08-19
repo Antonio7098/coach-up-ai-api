@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
+from starlette.responses import StreamingResponse
+import asyncio
 
 from app.middleware.request_id import RequestIdMiddleware
 
@@ -16,6 +18,17 @@ app.add_middleware(RequestIdMiddleware)
 async def health():
     return {"status": "ok"}
 
+async def _token_stream():
+    # Minimal stub stream to validate SSE pipeline
+    # Sends 5 tokens then a [DONE] marker
+    for token in ["Hello", ", ", "world", "!", "\n"]:
+        yield f"data: {token}\n\n"
+        await asyncio.sleep(0.2)
+    yield "data: [DONE]\n\n"
+
+@app.get("/chat/stream", tags=["chat"], description="SSE stream of chat tokens.")
+async def chat_stream():
+    return StreamingResponse(_token_stream(), media_type="text/event-stream")
 
 def custom_openapi():
     if app.openapi_schema:
@@ -27,7 +40,8 @@ def custom_openapi():
         routes=app.routes,
     )
     openapi_schema["tags"] = [
-        {"name": "meta", "description": "Service metadata and liveness"}
+        {"name": "meta", "description": "Service metadata and liveness"},
+        {"name": "chat", "description": "Realtime chat streaming (SSE)"},
     ]
     openapi_schema["servers"] = [
         {"url": "http://localhost:8000", "description": "Local dev"}
