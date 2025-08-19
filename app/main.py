@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Request, Query, Body
 from fastapi.openapi.utils import get_openapi
 from starlette.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
@@ -6,6 +6,7 @@ import asyncio
 import time
 import json
 import logging
+import uuid
 from typing import Optional
 
 from app.middleware.request_id import RequestIdMiddleware
@@ -97,6 +98,71 @@ async def chat_stream(
         resp.headers["X-Request-Id"] = str(request_id)
     return resp
 
+async def _run_assessment_job(session_id: str, group_id: str, request_id: Optional[str], rubric_version: str = "v1"):
+    start = time.perf_counter()
+    try:
+        logger.info(
+            json.dumps(
+                {
+                    "event": "assessments_job_start",
+                    "requestId": request_id,
+                    "sessionId": session_id,
+                    "groupId": group_id,
+                    "rubricVersion": rubric_version,
+                }
+            )
+        )
+        # Simulate rubric evaluation work
+        await asyncio.sleep(0.5)
+    finally:
+        total_s = time.perf_counter() - start
+        try:
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "assessments_job_complete",
+                        "requestId": request_id,
+                        "sessionId": session_id,
+                        "groupId": group_id,
+                        "rubricVersion": rubric_version,
+                        "total_ms": int(total_s * 1000),
+                    }
+                )
+            )
+        except Exception:
+            pass
+
+
+@app.post(
+    "/assessments/run",
+    tags=["assessments"],
+    description="Start a multi-turn assessment job for a session; returns a groupId.",
+)
+async def assessments_run(request: Request, sessionId: str = Body(..., embed=True, description="Session ID to assess")):
+    group_id = str(uuid.uuid4())
+    request_id = getattr(getattr(request, "state", object()), "request_id", None) or request.headers.get("x-request-id")
+    # Fire-and-forget background job
+    asyncio.create_task(_run_assessment_job(sessionId, group_id, request_id))
+    return {"groupId": group_id, "status": "accepted"}
+
+
+@app.get(
+    "/assessments/{sessionId}",
+    tags=["assessments"],
+    description="Fetch latest assessment summary for a session (stub).",
+)
+async def assessments_get(sessionId: str):
+    # Stub response for MVP wiring; replaced in later sprint work
+    return {
+        "sessionId": sessionId,
+        "latestGroupId": None,
+        "summary": {
+            "highlights": ["placeholder"],
+            "recommendations": ["placeholder"],
+            "rubricVersion": "v1",
+        },
+    }
+
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -109,6 +175,7 @@ def custom_openapi():
     openapi_schema["tags"] = [
         {"name": "meta", "description": "Service metadata and liveness"},
         {"name": "chat", "description": "Realtime chat streaming (SSE)"},
+        {"name": "assessments", "description": "Assessment runs and results"},
     ]
     openapi_schema["servers"] = [
         {"url": "http://localhost:8000", "description": "Local dev"}
