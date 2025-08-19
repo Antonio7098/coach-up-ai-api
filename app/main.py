@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 from starlette.responses import StreamingResponse
+from starlette.middleware.cors import CORSMiddleware
 import asyncio
 
 from app.middleware.request_id import RequestIdMiddleware
@@ -10,6 +11,14 @@ app = FastAPI(
     title="Coach Up AI API",
     description="AI service for assessments, multi-turn analysis, and provider integration.",
     version="0.1.0",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-Id"],
+    allow_credentials=False,
 )
 app.add_middleware(RequestIdMiddleware)
 

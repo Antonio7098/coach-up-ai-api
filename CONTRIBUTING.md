@@ -13,6 +13,19 @@ Thanks for contributing! This repo hosts the Python FastAPI AI service.
 - Lint OpenAPI: `make openapi-lint`
 - Build API docs (HTML): `make redoc-build`
 
+## Quick SSE test (local)
+With the server running on http://localhost:8000:
+
+```
+curl -N http://localhost:8000/chat/stream
+```
+
+You should see token chunks and a final `[DONE]` marker.
+
+## CORS (local dev)
+- The app allows CORS from `http://localhost:3000` for frontend development.
+- Header `X-Request-Id` is exposed so the frontend can correlate logs.
+
 ## PR checklist (Definition of Done)
 - [ ] References Sprint (SPR-###) and Features (FEAT-###) in PR description
 - [ ] Tests updated/added (pytest) if code changed
