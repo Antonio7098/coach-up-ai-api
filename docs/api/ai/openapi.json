@@ -1,0 +1,6 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "Coach Up AI API", "version": "v1" },
+  "paths": {},
+  "components": {}
+}
