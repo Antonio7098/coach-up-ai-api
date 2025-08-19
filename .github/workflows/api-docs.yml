@@ -1,0 +1,33 @@
+name: API Docs
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  api-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Lint OpenAPI (Spectral)
+        run: make openapi-lint
+
+      - name: Build API reference (Redoc)
+        run: make redoc-build
+
+      - name: Upload docs artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-docs-html
+          path: |
+            docs/api/ai/reference.html
+          if-no-files-found: ignore
