@@ -9,7 +9,8 @@ import time
 import json
 import logging
 import uuid
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Set
+import os
 
 from app.middleware.request_id import RequestIdMiddleware
 
@@ -49,6 +50,15 @@ async def _startup_event():
     app.state.assessment_queue = asyncio.Queue()  # type: ignore[attr-defined]
     app.state.assessment_results = {}  # type: ignore[attr-defined]
     app.state.assessment_worker_task = asyncio.create_task(_assessments_worker(app))  # type: ignore[attr-defined]
+    # In-memory session interaction state and processed ids
+    # session_state[session_id] = {
+    #   "active": bool,
+    #   "groupId": Optional[str],
+    #   "turnCount": int,
+    #   "lastTs": Optional[int]
+    # }
+    app.state.session_state: Dict[str, Dict[str, Any]] = {}
+    app.state.processed_message_ids: Set[str] = set()
 
 
 @app.on_event("shutdown")
@@ -229,6 +239,180 @@ async def _run_assessment_job(session_id: str, group_id: str, request_id: Option
     return scores
 
 
+# -----------------------------
+# Classifier (stub) and heuristics
+# -----------------------------
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+CLASSIFIER_CONF_ACCEPT = _env_float("CLASSIFIER_CONF_ACCEPT", 0.7)
+CLASSIFIER_CONF_LOW = _env_float("CLASSIFIER_CONF_LOW", 0.4)
+
+
+async def _classify_message_llm_stub(role: str, content: str, turn_count: int) -> Dict[str, Any]:
+    """Stub for LLM boundary classifier. Returns a decision with confidence.
+
+    This should be replaced by a real LLM call. For now, emit low confidence
+    or medium when clear cues are present.
+    """
+    text = (content or "").lower()
+    if role == "assistant" and any(cue in text for cue in ["good luck", "let me know", "hope this helps", "anything else"]):
+        return {"decision": "end", "confidence": 0.72, "reasons": "closing_cue"}
+    if role == "user" and any(cue in text for cue in ["plan", "over the next", "for two weeks", "step-by-step"]):
+        # Likely a new thread unless already active
+        return {"decision": "start" if turn_count == 0 else "continue", "confidence": 0.65, "reasons": "planning_intent"}
+    return {"decision": "abstain", "confidence": 0.2, "reasons": "unclear"}
+
+
+def _heuristic_decision(role: str, content: str, active: bool) -> str:
+    text = (content or "").lower()
+    if role == "assistant":
+        if any(cue in text for cue in ["good luck", "let me know", "anything else", "does that help", "glad to help"]):
+            return "end"
+        return "continue" if active else "ignore"
+    # user
+    if not active:
+        return "start"
+    return "continue"
+
+
+def _ensure_group(session_state: Dict[str, Any]) -> None:
+    if not session_state.get("groupId"):
+        session_state["groupId"] = str(uuid.uuid4())
+        session_state["turnCount"] = 0
+        session_state["active"] = True
+
+
+@app.post(
+    "/messages/ingest",
+    tags=["messages"],
+    description="Ingest a chat message, classify boundary, update session state, and enqueue assessments when interactions end.",
+)
+async def messages_ingest(request: Request):
+    request_id = getattr(getattr(request, "state", object()), "request_id", None) or request.headers.get("x-request-id")
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON body"}, status_code=400)
+
+    session_id: Optional[str] = payload.get("sessionId")
+    message_id: Optional[str] = payload.get("messageId")
+    role: Optional[str] = payload.get("role")
+    content: Optional[str] = payload.get("content")
+    ts: Optional[int] = payload.get("ts")
+
+    if not session_id or not message_id or not role:
+        return JSONResponse({"detail": "sessionId, messageId, and role are required"}, status_code=400)
+
+    # Idempotency: de-dupe by messageId
+    processed: Set[str] = app.state.processed_message_ids  # type: ignore[attr-defined]
+    if message_id in processed:
+        state = app.state.session_state.get(session_id, {"active": False, "groupId": None, "turnCount": 0})  # type: ignore[attr-defined]
+        resp = {
+            "state": "active" if state.get("active") else "idle",
+            "groupId": state.get("groupId"),
+            "turnCount": state.get("turnCount", 0),
+            "enqueued": False,
+            "deduped": True,
+        }
+        return JSONResponse(resp)
+
+    # Session state init
+    session_state = app.state.session_state.get(session_id)  # type: ignore[attr-defined]
+    if not session_state:
+        session_state = {"active": False, "groupId": None, "turnCount": 0, "lastTs": None}
+        app.state.session_state[session_id] = session_state  # type: ignore[attr-defined]
+
+    # LLM-first classification
+    turn_count = int(session_state.get("turnCount", 0))
+    cls = await _classify_message_llm_stub(role, content or "", turn_count)
+    decision: str = cls.get("decision", "abstain")
+    confidence: float = float(cls.get("confidence", 0.0))
+    accepted = confidence >= CLASSIFIER_CONF_ACCEPT
+    low = CLASSIFIER_CONF_LOW <= confidence < CLASSIFIER_CONF_ACCEPT
+
+    if not accepted:
+        # Apply heuristic fallback or override if low or abstain
+        heuristic = _heuristic_decision(role, content or "", bool(session_state.get("active")))
+        decision = heuristic if confidence < CLASSIFIER_CONF_LOW else decision
+
+    # Apply state machine
+    enqueued = False
+    if decision == "start":
+        _ensure_group(session_state)
+        session_state["turnCount"] = int(session_state.get("turnCount", 0)) + 1
+        session_state["active"] = True
+    elif decision == "continue":
+        if not session_state.get("active"):
+            _ensure_group(session_state)
+        session_state["turnCount"] = int(session_state.get("turnCount", 0)) + 1
+        session_state["active"] = True
+    elif decision == "end":
+        if not session_state.get("active"):
+            # nothing to end; ignore
+            pass
+        else:
+            # enqueue assessment for this group
+            try:
+                await app.state.assessment_queue.put((session_id, session_state.get("groupId"), request_id))  # type: ignore[attr-defined]
+                enqueued = True
+            except Exception:
+                asyncio.create_task(_run_assessment_job(session_id, session_state.get("groupId"), request_id))
+                enqueued = True
+        # finalize interaction
+        session_state["active"] = False
+    elif decision == "one_off":
+        # Enqueue single-turn assessment immediately
+        gid = str(uuid.uuid4())
+        try:
+            await app.state.assessment_queue.put((session_id, gid, request_id))  # type: ignore[attr-defined]
+            enqueued = True
+        except Exception:
+            asyncio.create_task(_run_assessment_job(session_id, gid, request_id))
+            enqueued = True
+        session_state["active"] = False
+        session_state["groupId"] = gid
+        session_state["turnCount"] = 1
+    else:
+        # ignore/abstain: no state change
+        pass
+
+    # Update last timestamp and processed set
+    session_state["lastTs"] = ts
+    processed.add(message_id)
+
+    # Build response
+    resp = {
+        "state": "active" if session_state.get("active") else "idle",
+        "groupId": session_state.get("groupId"),
+        "turnCount": session_state.get("turnCount", 0),
+        "enqueued": enqueued,
+    }
+    try:
+        logger.info(
+            json.dumps(
+                {
+                    "event": "messages_ingest",
+                    "requestId": request_id,
+                    "sessionId": session_id,
+                    "messageId": message_id,
+                    "decision": decision,
+                    "confidence": confidence,
+                    "accepted": accepted,
+                    "low": low,
+                    "enqueued": enqueued,
+                }
+            )
+        )
+    except Exception:
+        pass
+    return JSONResponse(resp)
+
 @app.post(
     "/assessments/run",
     tags=["assessments"],
@@ -328,6 +512,7 @@ def custom_openapi():
         {"name": "meta", "description": "Service metadata and liveness"},
         {"name": "chat", "description": "Realtime chat streaming (SSE)"},
         {"name": "assessments", "description": "Assessment runs and results"},
+        {"name": "messages", "description": "Message ingestion and boundary classification"},
     ]
     openapi_schema["servers"] = [
         {"url": "http://localhost:8000", "description": "Local dev"}
