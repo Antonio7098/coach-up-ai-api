@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, Query, Body
 from fastapi.openapi.utils import get_openapi
 from starlette.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 import asyncio
 import time
@@ -166,11 +167,25 @@ async def _run_assessment_job(session_id: str, group_id: str, request_id: Option
     tags=["assessments"],
     description="Start a multi-turn assessment job for a session; returns a groupId.",
 )
-async def assessments_run(request: Request, sessionId: str = Body(..., embed=True, description="Session ID to assess")):
+async def assessments_run(request: Request):
+    # Accept sessionId from JSON body (embedded) or query string for robustness
+    session_id: Optional[str] = None
+    try:
+        payload = await request.json()
+        if isinstance(payload, dict):
+            session_id = payload.get("sessionId")
+    except Exception:
+        # Not JSON or invalid body, fall back to query param
+        pass
+    if not session_id:
+        session_id = request.query_params.get("sessionId")
+    if not session_id:
+        return JSONResponse({"detail": "sessionId required"}, status_code=400)
+
     group_id = str(uuid.uuid4())
     request_id = getattr(getattr(request, "state", object()), "request_id", None) or request.headers.get("x-request-id")
     # Fire-and-forget background job
-    asyncio.create_task(_run_assessment_job(sessionId, group_id, request_id))
+    asyncio.create_task(_run_assessment_job(session_id, group_id, request_id))
     return {"groupId": group_id, "status": "accepted"}
 
 
