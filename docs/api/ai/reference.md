@@ -10,22 +10,36 @@ Overview of AI endpoints (chat streaming, assessments, summaries) served by the 
 
 ## Endpoints (MVP)
 
-### POST /v1/chat/stream
-- Summary: Stream LLM tokens for chat interaction.
-- Auth: required (service)
+### GET /chat/stream
+- Summary: Stream tokens via SSE for chat.
 - Headers: X-Request-Id, Accept: text/event-stream
-- Body: { "message": string, "sessionId": string }
+- Query: prompt? (optional)
 - Response: text/event-stream
 
-### POST /v1/assessments/batch
-- Summary: Analyze a batch of interactions; return per-focus assessments.
-- Auth: required (service)
-- Body: { "interactionIds": string[], "rubricVersion": string }
-- Response: { "groupId": string, "assessments": Assessment[] }
+### POST /assessments/run
+- Summary: Start a multi-turn assessment job for a session; returns a groupId.
+- Body: { "sessionId": string }
+- Response: { "groupId": string, "status": "accepted" }
 
-### POST /v1/summary/generate
-- Summary: Generate end-of-session summary document.
-- Auth: required (service)
+Example:
+
+```bash
+curl -s --json '{"sessionId":"s_demo"}' http://localhost:8000/assessments/run
+```
+
+### GET /assessments/{sessionId}
+- Summary: Fetch latest assessment summary for a session.
+- Response: { sessionId, latestGroupId, summary: { highlights[], recommendations[], categories[], scores{...}, meta{...}, rubricVersion, rubricKeyPoints[] } }
+
+Example:
+
+```bash
+curl -s http://localhost:8000/assessments/s_demo | jq .
+```
+
+### GET /metrics
+- Summary: Prometheus metrics endpoint for SQS + assessment worker instrumentation.
+- Media type: text/plain; version=0.0.4
 
 ### GET /health
 - Summary: healthcheck endpoint.
@@ -35,4 +49,5 @@ Overview of AI endpoints (chat streaming, assessments, summaries) served by the 
 - Snapshot: curl http://localhost:8000/openapi.json > docs/api/ai/openapi.json
 
 ## Changelog
+- 2025-08-21: Updated endpoints to assessments run/get; documented expanded summary payload (categories, scores, meta, rubricVersion, rubricKeyPoints).
 - 2025-08-19: Initial stub added.

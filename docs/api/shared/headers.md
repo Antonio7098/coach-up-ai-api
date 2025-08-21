@@ -15,4 +15,4 @@
 - 429 with Retry-After header on limit exceeded
 
 ## Tracing
-- Include requestId in all logs; optionally include hashed userId/sessionId/focusId/groupId
+- Include requestId in all logs; optionally include hashed userId/sessionId/trackedSkillId/groupId

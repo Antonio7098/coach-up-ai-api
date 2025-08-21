@@ -1,6 +1,7 @@
 import json
 import time
 import uuid
+import hashlib
 from typing import Callable
 
 from fastapi import Request
@@ -21,6 +22,16 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         start = time.time()
         req_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
         request.state.request_id = req_id
+        # Optional: hash tracked skill id header for logging
+        try:
+            tsid = request.headers.get("X-Tracked-Skill-Id")
+            tsid_hash = hashlib.sha256(tsid.encode("utf-8")).hexdigest() if tsid else None
+        except Exception:
+            tsid_hash = None
+        try:
+            request.state.tracked_skill_id_hash = tsid_hash
+        except Exception:
+            pass
 
         response = await call_next(request)
         response.headers["X-Request-Id"] = req_id
@@ -30,6 +41,7 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
                 "ts": int(time.time() * 1000),
                 "level": "info",
                 "requestId": req_id,
+                "trackedSkillIdHash": tsid_hash,
                 "method": request.method,
                 "path": request.url.path,
                 "status": response.status_code,

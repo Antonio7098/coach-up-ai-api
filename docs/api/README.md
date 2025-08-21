@@ -21,3 +21,11 @@ This folder contains human-friendly references and machine-readable specs for th
 - Source of truth: Pydantic models and FastAPI routes
 - Snapshot OpenAPI locally: `curl http://localhost:8000/openapi.json > docs/api/ai/openapi.json`
 - Optional: lint OpenAPI with Spectral in CI.
+
+## E2E toggles
+- SKIP_AI_CONTRACTS
+  - When set to `1` or `true` (in frontend Playwright), AI contract tests are skipped and the FastAPI server is not started by the test runner.
+  - Use for UI-only smoke runs.
+- MOCK_CONVEX
+  - Controlled by the frontend during E2E. When `1`, Next.js proxy uses an in-memory Convex mock; AI API behavior is unchanged.
+  - Unset or `0` when running against a real Convex dev server.
