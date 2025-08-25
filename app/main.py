@@ -42,6 +42,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
     CONTENT_TYPE_LATEST = "text/plain"
 
 from app.middleware.request_id import RequestIdMiddleware
+from app.providers.factory import get_chat_client, get_classifier_client
 
 
 app = FastAPI(
@@ -279,11 +280,17 @@ async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 async def _token_stream():
-    # Minimal stub stream to validate SSE pipeline
-    # Sends 5 tokens then a [DONE] marker
-    for token in ["Hello", ", ", "world", "!", "\n"]:
+    # Longer stub stream to validate SSE pipeline and client-side TTS segmentation
+    tokens = [
+        "This ", "is ", "a ", "longer ", "streaming ", "sample ", "so ", "you ", "can ", "test ", "incremental ", "text-to-speech", ". ",
+        "It ", "includes ", "multiple ", "sentences", ", ", "commas", ", ", "and ", "pauses", ". ",
+        "As ", "each ", "sentence ", "arrives", ", ", "the ", "client ", "should ", "synthesize ", "and ", "enqueue ", "audio ", "chunks", ". ",
+        "Try ", "interrupting ", "the ", "playback ", "to ", "confirm ", "barge-in ", "behavior", ". ",
+        "Finally", ", ", "notice ", "how ", "punctuation ", "causes ", "natural ", "breaks ", "in ", "speech", ".\n",
+    ]
+    for token in tokens:
         yield f"data: {token}\n\n"
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.15)
     yield "data: [DONE]\n\n"
 
 @app.get("/chat/stream", tags=["chat"], description="SSE stream of chat tokens.")
@@ -293,6 +300,8 @@ async def chat_stream(
 ):
     start = time.perf_counter()
     first_token_s: Optional[float] = None
+    provider_name: Optional[str] = None
+    model_name: Optional[str] = None
 
     # Try to obtain request id from middleware or header
     request_id = getattr(getattr(request, "state", object()), "request_id", None) or request.headers.get("x-request-id")
@@ -305,9 +314,49 @@ async def chat_stream(
         except Exception:
             tracked_hash = None
 
+    # Provider selection (env-gated)
+    _enabled = os.getenv("AI_CHAT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    _model = os.getenv("AI_CHAT_MODEL", "").strip() or None
+
     async def instrumented_stream():
         nonlocal first_token_s
+        nonlocal provider_name
+        nonlocal model_name
         try:
+            if _enabled:
+                try:
+                    client = get_chat_client(model=_model)
+                    provider_name = getattr(client, "provider_name", None) or "unknown"
+                    model_name = getattr(client, "model", None)
+                    async for token in client.stream_chat(prompt or ""):
+                        chunk = f"data: {token}\n\n"
+                        if first_token_s is None:
+                            first_token_s = time.perf_counter() - start
+                            try:
+                                logger.info(
+                                    json.dumps(
+                                        {
+                                            "event": "chat_stream_first_token",
+                                            "requestId": request_id,
+                                            "trackedSkillIdHash": tracked_hash,
+                                            "ttft_ms": int(first_token_s * 1000),
+                                            "route": "/chat/stream",
+                                            "prompt_present": bool(prompt),
+                                            "provider": provider_name,
+                                            "model": model_name,
+                                        }
+                                    )
+                                )
+                            except Exception:
+                                pass
+                        yield chunk
+                    # End-of-stream marker
+                    yield "data: [DONE]\n\n"
+                    return
+                except Exception:
+                    # Fallback to stub stream on any provider error
+                    provider_name = provider_name or "fallback_stub"
+                    model_name = model_name or None
             async for chunk in _token_stream():
                 if first_token_s is None:
                     first_token_s = time.perf_counter() - start
@@ -321,6 +370,8 @@ async def chat_stream(
                                     "ttft_ms": int(first_token_s * 1000),
                                     "route": "/chat/stream",
                                     "prompt_present": bool(prompt),
+                                    "provider": provider_name or ("provider" if _enabled else "stub"),
+                                    "model": model_name,
                                 }
                             )
                         )
@@ -340,6 +391,8 @@ async def chat_stream(
                             "total_ms": int(total_s * 1000),
                             "route": "/chat/stream",
                             "prompt_present": bool(prompt),
+                            "provider": provider_name or ("provider" if _enabled else "stub"),
+                            "model": model_name,
                         }
                     )
                 )
@@ -1022,10 +1075,40 @@ async def messages_ingest(request: Request):
         # Do not fail ingestion if transcript buffering has issues
         evt_idx = -1  # sentinel
 
-    # LLM-first classification (support both sync and async stubs)
+    # Classifier provider integration (env-gated) with robust fallback
     turn_count = int(session_state.get("turnCount", 0))
-    _cls_res = _classify_message_llm_stub(role, content or "", turn_count)
-    cls = await _cls_res if inspect.isawaitable(_cls_res) else _cls_res
+    cls_provider: Optional[str] = None
+    cls_model: Optional[str] = None
+    _cls_enabled = os.getenv("AI_CLASSIFIER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    try:
+        # Back-compat toggle: DISABLE_CLASSIFIER=1 forces disabled
+        if os.getenv("DISABLE_CLASSIFIER", "0").strip().lower() in ("1", "true", "yes", "on"):
+            _cls_enabled = False
+    except Exception:
+        pass
+
+    if _cls_enabled:
+        try:
+            _cls_model = os.getenv("AI_CLASSIFIER_MODEL", "").strip() or None
+            client = get_classifier_client(model=_cls_model)
+            cls_provider = getattr(client, "provider_name", None) or "unknown"
+            cls_model = getattr(client, "model", None)
+            cls = await client.classify(role, content or "", turn_count)
+        except Exception:
+            # Fallback to deterministic mock classifier
+            try:
+                client = get_classifier_client(provider="mock", model=os.getenv("AI_CLASSIFIER_MODEL", "").strip() or None)
+                cls_provider = getattr(client, "provider_name", None) or "mock"
+                cls_model = getattr(client, "model", None)
+                cls = await client.classify(role, content or "", turn_count)
+            except Exception:
+                # Last resort: local stub
+                _cls_res = _classify_message_llm_stub(role, content or "", turn_count)
+                cls = await _cls_res if inspect.isawaitable(_cls_res) else _cls_res
+    else:
+        _cls_res = _classify_message_llm_stub(role, content or "", turn_count)
+        cls = await _cls_res if inspect.isawaitable(_cls_res) else _cls_res
+
     decision: str = cls.get("decision", "abstain")
     confidence: float = float(cls.get("confidence", 0.0))
     accepted = confidence >= CLASSIFIER_CONF_ACCEPT
@@ -1283,6 +1366,9 @@ async def messages_ingest(request: Request):
                     "accepted": accepted,
                     "low": low,
                     "enqueued": enqueued,
+                    "classifierEnabled": _cls_enabled,
+                    "classifierProvider": cls_provider,
+                    "classifierModel": cls_model,
                 }
             )
         )
