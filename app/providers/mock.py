@@ -10,7 +10,7 @@ class MockChatClient(ChatClient):
     def __init__(self, model: Optional[str] = None):
         super().__init__(model=model or "mock-chat-1")
 
-    async def stream_chat(self, prompt: str, system: Optional[str] = None) -> AsyncIterator[str]:
+    async def stream_chat(self, prompt: str, system: Optional[str] = None, request_id: Optional[str] = None) -> AsyncIterator[str]:
         text = prompt or "Hello, world!"
         # Stream in small chunks deterministically
         for token in _chunk_text(text, size=6):
@@ -29,7 +29,7 @@ class MockClassifierClient(ClassifierClient):
     def __init__(self, model: Optional[str] = None):
         super().__init__(model=model or "mock-cls-1")
 
-    async def classify(self, role: str, content: str, turn_count: int) -> Dict[str, Any]:
+    async def classify(self, role: str, content: str, turn_count: int, request_id: Optional[str] = None) -> Dict[str, Any]:
         text = (content or "").lower()
         # Simple deterministic pattern to emulate boundary decisions
         if role == "assistant" and any(cue in text for cue in ["good luck", "let me know", "anything else", "does that help", "glad to help"]):
@@ -46,6 +46,24 @@ class MockAssessClient(AssessClient):
     def __init__(self, model: Optional[str] = None):
         super().__init__(model=model or "mock-assess-1")
 
-    async def assess(self, transcript: List[Dict[str, Any]], rubric_version: str = "v1") -> Dict[str, Any]:
-        # Placeholder; real implementation will be added in subsequent steps
-        return {"rubricVersion": rubric_version, "highlights": ["placeholder"], "recommendations": ["placeholder"], "scores": {}}
+    async def assess(
+        self,
+        transcript: List[Dict[str, Any]],
+        rubric_version: str = "v1",
+        request_id: Optional[str] = None,
+        skill: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        # Deterministic placeholder including optional skill context in meta
+        meta: Dict[str, Any] = {"provider": self.provider_name}
+        if request_id:
+            meta["requestId"] = request_id
+        if skill:
+            meta["skill"] = {k: skill.get(k) for k in ("id", "name", "category") if k in skill}
+        return {
+            "rubricVersion": rubric_version,
+            "categories": [],
+            "scores": {},
+            "highlights": ["placeholder"],
+            "recommendations": ["placeholder"],
+            "meta": meta,
+        }

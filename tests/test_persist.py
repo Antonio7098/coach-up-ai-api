@@ -31,8 +31,8 @@ def test_persist_assessment_if_configured_noop_when_url_missing(monkeypatch):
             main._persist_assessment_if_configured(
                 session_id="s1",
                 group_id="g1",
-                summary={"highlights": ["h"], "recommendations": ["r"], "rubricKeyPoints": ["k:0.5"]},
-                rubric_version="v1",
+                summary={"skillAssessments": [], "meta": {"provider": "stub", "model": "stub", "skillsCount": 0}},
+                rubric_version="v2",
                 request_id="rid-1",
             )
         )
@@ -59,9 +59,8 @@ def test_persist_assessment_if_configured_sends_expected_payload_and_headers(mon
     monkeypatch.setattr(main, "PERSIST_ASSESSMENTS_SECRET", "topsecret")
 
     payload_summary = {
-        "highlights": ["a"],
-        "recommendations": ["b"],
-        "rubricKeyPoints": ["correctness:0.9"],
+        "skillAssessments": [],
+        "meta": {"provider": "stub", "model": "stub", "skillsCount": 0},
     }
 
     loop = asyncio.new_event_loop()
@@ -71,7 +70,7 @@ def test_persist_assessment_if_configured_sends_expected_payload_and_headers(mon
                 session_id="sess-123",
                 group_id="grp-456",
                 summary=payload_summary,
-                rubric_version="v1",
+                rubric_version="v2",
                 request_id="req-xyz",
             )
         )
@@ -92,6 +91,6 @@ def test_persist_assessment_if_configured_sends_expected_payload_and_headers(mon
     assert body == {
         "sessionId": "sess-123",
         "groupId": "grp-456",
-        "rubricVersion": "v1",
+        "rubricVersion": "v2",
         "summary": payload_summary,
     }

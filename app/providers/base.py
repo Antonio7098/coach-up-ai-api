@@ -16,7 +16,7 @@ class ChatClient(abc.ABC):
         self.model = model
 
     @abc.abstractmethod
-    async def stream_chat(self, prompt: str, system: Optional[str] = None) -> AsyncIterator[str]:
+    async def stream_chat(self, prompt: str, system: Optional[str] = None, request_id: Optional[str] = None) -> AsyncIterator[str]:
         ...
 
 
@@ -29,7 +29,7 @@ class ClassifierClient(abc.ABC):
         self.model = model
 
     @abc.abstractmethod
-    async def classify(self, role: str, content: str, turn_count: int) -> dict:
+    async def classify(self, role: str, content: str, turn_count: int, request_id: Optional[str] = None) -> dict:
         ...
 
 
@@ -42,5 +42,11 @@ class AssessClient(abc.ABC):
         self.model = model
 
     @abc.abstractmethod
-    async def assess(self, transcript: list[dict], rubric_version: str = "v1") -> dict:
+    async def assess(
+        self,
+        transcript: list[dict],
+        rubric_version: str = "v1",
+        request_id: Optional[str] = None,
+        skill: Optional[dict] = None,
+    ) -> dict:
         ...

@@ -17,6 +17,7 @@ import urllib.error
 import os
 import hashlib
 from contextlib import asynccontextmanager
+import httpx
 try:
     from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
     METRICS_ENABLED = True
@@ -42,7 +43,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
     CONTENT_TYPE_LATEST = "text/plain"
 
 from app.middleware.request_id import RequestIdMiddleware
-from app.providers.factory import get_chat_client, get_classifier_client
+from app.providers.factory import get_chat_client, get_classifier_client, get_assess_client
 
 
 app = FastAPI(
@@ -59,6 +60,40 @@ app.add_middleware(
     allow_credentials=False,
 )
 app.add_middleware(RequestIdMiddleware)
+
+# HTTP metrics middleware
+@app.middleware("http")
+async def _http_metrics_middleware(request: Request, call_next):
+    t0 = time.perf_counter()
+    method = request.method
+    path = request.url.path
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = getattr(response, "status_code", 500)
+        return response
+    except Exception:
+        status_code = 500
+        raise
+    finally:
+        try:
+            status_class = f"{status_code // 100}xx"
+            HTTP_REQUESTS_TOTAL.labels(method=method, path=path, status_class=status_class).inc()
+            HTTP_REQUEST_DURATION_SECONDS.labels(method=method, path=path).observe(time.perf_counter() - t0)
+        except Exception:
+            pass
+
+# HTTP request metrics
+HTTP_REQUESTS_TOTAL = Counter(
+    "coachup_http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status_class"],
+)
+HTTP_REQUEST_DURATION_SECONDS = Histogram(
+    "coachup_http_request_duration_seconds",
+    "Duration of HTTP requests in seconds",
+    ["method", "path"],
+)
 
 logger = logging.getLogger("coach_up.ai.chat")
 
@@ -77,6 +112,42 @@ ASSESS_ENQUEUE_LAT_SECONDS = Histogram("coachup_assessments_enqueue_latency_seco
 ASSESS_RETRIES_TOTAL = Counter("coachup_assessments_retries_total", "Assessment retries")
 ASSESS_JOBS_TOTAL = Counter("coachup_assessments_jobs_total", "Assessment job outcomes", ["status"])
 QUE_DEPTH = Gauge("coachup_assessments_queue_depth", "Assessments queue depth (in-memory provider only)", ["provider"])
+
+# Aggregated tokens and cost metrics (by provider/model/rubric)
+ASSESS_TOKENS_TOTAL = Counter(
+    "coachup_assessment_tokens_total",
+    "Total assessment tokens",
+    ["direction", "provider", "model", "rubric_version"],
+)
+ASSESS_COST_USD_TOTAL = Counter(
+    "coachup_assessment_cost_usd_total",
+    "Total assessment cost in USD",
+    ["provider", "model", "rubric_version"],
+)
+
+# Per-skill assessment metrics
+ASSESS_SKILL_SECONDS = Histogram(
+    "coachup_assessment_skill_seconds",
+    "Duration of per-skill assessment in seconds",
+    ["provider", "model", "rubric_version"],
+)
+ASSESS_SKILL_ERRORS_TOTAL = Counter(
+    "coachup_assessment_skill_errors_total",
+    "Per-skill provider assessment errors",
+    ["provider", "model", "reason"],
+)
+
+# Chat streaming metrics
+CHAT_TTFT_SECONDS = Histogram(
+    "coachup_chat_ttft_seconds",
+    "Time to first token for chat streaming in seconds",
+    ["provider", "model"],
+)
+CHAT_TOTAL_SECONDS = Histogram(
+    "coachup_chat_total_seconds",
+    "Total chat streaming duration in seconds",
+    ["provider", "model"],
+)
 
 # Rubric v1 categories (normalized [0,1])
 # TODO(SPR-002 backend): Replace this stub with finalized rubric v1 definitions
@@ -209,7 +280,7 @@ async def _assessments_worker(app: FastAPI, worker_index: int = 0):
                     scores, summary_obj = res
                 else:
                     scores = res
-                    summary_obj = _compute_rubric_v1_summary_from_spans(session_id, group_id, scores, rubric_version="v1")
+                    summary_obj = _compute_rubric_v1_summary_from_spans(session_id, group_id, scores, rubric_version="v2")
                 if scores:
                     break
                 backoff_ms = ASSESSMENTS_BACKOFF_BASE_MS * (2 ** (attempt - 1))
@@ -238,26 +309,15 @@ async def _assessments_worker(app: FastAPI, worker_index: int = 0):
                 pass
             # Persist latest results in-memory (stub; replace with Convex in later sprint step)
             if summary_obj is None:
-                summary_obj = _compute_rubric_v1_summary_from_spans(session_id, group_id, scores, rubric_version="v1")
+                summary_obj = _compute_rubric_v1_summary_from_spans(session_id, group_id, scores, rubric_version="v2")
             results[session_id] = {
                 "latestGroupId": group_id,
                 "summary": summary_obj,
             }
             # Optional HTTP persistence callback for integration with Convex/Next.js
-            # Map to Convex finalize summary shape and include deterministic meta/categorical fields
-            summary_for_persist = {
-                "highlights": summary_obj.get("highlights", []) or ["placeholder"],
-                "recommendations": summary_obj.get("recommendations", []) or ["placeholder"],
-                "categories": summary_obj.get("categories", RUBRIC_V1_CATEGORIES),
-                "scores": scores,
-                "meta": summary_obj.get("meta", {}),
-                "rubricVersion": summary_obj.get("rubricVersion", "v1"),
-                "rubricKeyPoints": [
-                    f"{cat}:{scores.get(cat)}" for cat in RUBRIC_V1_CATEGORIES
-                ],
-            }
             try:
-                await _persist_assessment_if_configured(session_id, group_id, summary_for_persist, "v1", request_id)
+                v2_payload = _build_v2_persist_payload(summary_obj or {}, scores)
+                await _persist_assessment_if_configured(session_id, group_id, v2_payload, "v2", request_id)
             except Exception:
                 pass
         except asyncio.CancelledError:
@@ -310,7 +370,7 @@ async def chat_stream(
     if not tracked_hash:
         try:
             _tsid = request.headers.get("x-tracked-skill-id")
-            tracked_hash = hashlib.sha256(_tsid.encode("utf-8")).hexdigest() if _tsid else None
+            tracked_hash = _skill_hash(_tsid) if _tsid else None
         except Exception:
             tracked_hash = None
 
@@ -328,7 +388,7 @@ async def chat_stream(
                     client = get_chat_client(model=_model)
                     provider_name = getattr(client, "provider_name", None) or "unknown"
                     model_name = getattr(client, "model", None)
-                    async for token in client.stream_chat(prompt or ""):
+                    async for token in client.stream_chat(prompt or "", request_id=request_id):
                         chunk = f"data: {token}\n\n"
                         if first_token_s is None:
                             first_token_s = time.perf_counter() - start
@@ -349,11 +409,37 @@ async def chat_stream(
                                 )
                             except Exception:
                                 pass
+                            # Metrics: observe TTFT for provider path
+                            try:
+                                CHAT_TTFT_SECONDS.labels(
+                                    provider=str(provider_name or "provider"),
+                                    model=str(model_name or "unknown"),
+                                ).observe(first_token_s)
+                            except Exception:
+                                pass
                         yield chunk
                     # End-of-stream marker
                     yield "data: [DONE]\n\n"
                     return
-                except Exception:
+                except Exception as e:
+                    # Log provider error and fall back to stub stream
+                    try:
+                        logger.exception(
+                            json.dumps(
+                                {
+                                    "event": "chat_stream_provider_error",
+                                    "requestId": request_id,
+                                    "trackedSkillIdHash": tracked_hash,
+                                    "route": "/chat/stream",
+                                    "prompt_present": bool(prompt),
+                                    "provider": provider_name or "unknown",
+                                    "model": model_name,
+                                    "error": str(e),
+                                }
+                            )
+                        )
+                    except Exception:
+                        pass
                     # Fallback to stub stream on any provider error
                     provider_name = provider_name or "fallback_stub"
                     model_name = model_name or None
@@ -377,6 +463,14 @@ async def chat_stream(
                         )
                     except Exception:
                         pass
+                    # Metrics: observe TTFT for fallback/stub path
+                    try:
+                        CHAT_TTFT_SECONDS.labels(
+                            provider=str(provider_name or ("provider" if _enabled else "stub")),
+                            model=str(model_name or "unknown"),
+                        ).observe(first_token_s)
+                    except Exception:
+                        pass
                 yield chunk
         finally:
             total_s = time.perf_counter() - start
@@ -398,6 +492,14 @@ async def chat_stream(
                 )
             except Exception:
                 pass
+            # Metrics: observe total stream duration
+            try:
+                CHAT_TOTAL_SECONDS.labels(
+                    provider=str(provider_name or ("provider" if _enabled else "stub")),
+                    model=str(model_name or "unknown"),
+                ).observe(total_s)
+            except Exception:
+                pass
 
     resp = StreamingResponse(instrumented_stream(), media_type="text/event-stream")
     if request_id:
@@ -409,7 +511,7 @@ def _compute_rubric_v1_summary_from_spans(
     session_id: str,
     group_id: str,
     scores: Dict[str, float],
-    rubric_version: str = "v1",
+    rubric_version: str = "v2",
 ) -> Dict[str, Any]:
     """Slice transcript by (sessionId, groupId) spans and build a deterministic summary.
 
@@ -472,11 +574,347 @@ def _compute_rubric_v1_summary_from_spans(
         },
     }
 
+async def _get_tracked_skills_for_session(session_id: str) -> List[Dict[str, Any]]:
+    """Fetch tracked skills for a session.
+
+    Flow:
+      1) Resolve userId from Convex via sessions:getBySessionId
+      2) Fetch tracked skills for that user via skills:getTrackedSkillsForUser
+      3) Normalize to [{id,name,category}] ordered by tracked order
+      4) On any failure or missing config, fall back to ASSESS_TRACKED_SKILLS_JSON
+    """
+
+    def _fallback_from_env() -> List[Dict[str, Any]]:
+        try:
+            raw = (os.getenv("ASSESS_TRACKED_SKILLS_JSON", "") or "").strip()
+            if not raw:
+                return []
+            val = json.loads(raw)
+            if isinstance(val, list):
+                out2: List[Dict[str, Any]] = []
+                for it in val:
+                    if isinstance(it, dict):
+                        out2.append(
+                            {
+                                "id": it.get("id"),
+                                "name": it.get("name"),
+                                "category": it.get("category"),
+                            }
+                        )
+                return out2
+        except Exception:
+            pass
+        return []
+
+    try:
+        base_url = (os.getenv("CONVEX_URL") or "").strip()
+        if not base_url:
+            return _fallback_from_env()
+
+        url = base_url.rstrip("/") + "/api/query"
+        # Reuse global HTTP timeout when present; default 10s
+        try:
+            timeout_s = float(os.getenv("CONVEX_TIMEOUT_SECONDS") or os.getenv("AI_HTTP_TIMEOUT_SECONDS") or 10)
+        except Exception:
+            timeout_s = 10.0
+
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            # 1) Resolve session -> userId
+            payload1 = {
+                "path": "functions/sessions:getBySessionId",
+                "args": {"sessionId": session_id},
+                "format": "json",
+            }
+            resp1 = await client.post(url, json=payload1, headers={"Content-Type": "application/json"})
+            data1 = resp1.json() if resp1.headers.get("content-type", "").startswith("application/json") else {}
+            if resp1.status_code >= 400 or (isinstance(data1, dict) and data1.get("status") == "error"):
+                return _fallback_from_env()
+            session_doc = data1.get("value") if isinstance(data1, dict) else None
+            user_id = (session_doc or {}).get("userId") if isinstance(session_doc, dict) else None
+            if not user_id or not str(user_id).strip():
+                return _fallback_from_env()
+
+            # 2) Fetch tracked skills for user
+            payload2 = {
+                "path": "functions/skills:getTrackedSkillsForUser",
+                "args": {"userId": str(user_id)},
+                "format": "json",
+            }
+            resp2 = await client.post(url, json=payload2, headers={"Content-Type": "application/json"})
+            data2 = resp2.json() if resp2.headers.get("content-type", "").startswith("application/json") else {}
+            if resp2.status_code >= 400 or (isinstance(data2, dict) and data2.get("status") == "error"):
+                return _fallback_from_env()
+            rows = data2.get("value") if isinstance(data2, dict) else None
+
+            # 3) Normalize to expected provider skill shape
+            out: List[Dict[str, Any]] = []
+            if isinstance(rows, list):
+                try:
+                    rows_sorted = sorted(rows, key=lambda r: ((r or {}).get("order") or 0))
+                except Exception:
+                    rows_sorted = rows
+                for r in rows_sorted:
+                    if not isinstance(r, dict):
+                        continue
+                    skill = r.get("skill") if isinstance(r.get("skill"), dict) else {}
+                    sid_raw = (skill.get("id") if isinstance(skill, dict) else None) or r.get("skillId")
+                    sid = str(sid_raw).strip() if sid_raw is not None else ""
+                    if not sid:
+                        continue
+                    title = None
+                    if isinstance(skill, dict):
+                        title = skill.get("title") or skill.get("name")
+                    name = str(title or sid)
+                    category = (skill.get("category") if isinstance(skill, dict) else None)
+                    out.append({"id": sid, "name": name, "category": category})
+            if out:
+                return out
+            return _fallback_from_env()
+    except Exception:
+        return _fallback_from_env()
+
+
+# ===== Convex helpers for transcripts & session state =====
+def _convex_base_url() -> Optional[str]:
+    try:
+        base = (os.getenv("CONVEX_URL") or "").strip()
+        return base or None
+    except Exception:
+        return None
+
+
+def _convex_timeout_seconds() -> float:
+    try:
+        return float(os.getenv("CONVEX_TIMEOUT_SECONDS") or os.getenv("AI_HTTP_TIMEOUT_SECONDS") or 10)
+    except Exception:
+        return 10.0
+
+
+async def _convex_query(path: str, args: Dict[str, Any], *, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    base = _convex_base_url()
+    if not base:
+        return None
+    url = base.rstrip("/") + "/api/query"
+    payload = {"path": path, "args": args, "format": "json"}
+    t = _convex_timeout_seconds() if timeout is None else timeout
+    async with httpx.AsyncClient(timeout=t) as client:
+        resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+        if resp.status_code >= 400:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return None
+
+
+async def _convex_mutation(path: str, args: Dict[str, Any], *, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    base = _convex_base_url()
+    if not base:
+        return None
+    url = base.rstrip("/") + "/api/mutation"
+    payload = {"path": path, "args": args, "format": "json"}
+    t = _convex_timeout_seconds() if timeout is None else timeout
+    async with httpx.AsyncClient(timeout=t) as client:
+        resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+        if resp.status_code >= 400:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return None
+
+
+async def _get_session_doc(session_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        data = await _convex_query("functions/sessions:getBySessionId", {"sessionId": session_id})
+        if isinstance(data, dict):
+            # { status: 'success', value: {...} } shape from Convex HTTP
+            val = data.get("value") if data.get("status") != "error" else None
+            return val if isinstance(val, dict) else None
+    except Exception:
+        return None
+    return None
+
+
+def _sha256_hex(s: str) -> str:
+    try:
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+    except Exception:
+        return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+
+
+def _chat_context_limit_default() -> int:
+    """Default number of recent messages to include in chat context.
+
+    Reads CHAT_CONTEXT_LIMIT from env, clamps to [1, 200], defaults to 10.
+    """
+    try:
+        v = int((os.getenv("CHAT_CONTEXT_LIMIT") or "10").strip())
+    except Exception:
+        v = 10
+    if v < 1:
+        v = 1
+    if v > 200:
+        v = 200
+    return v
+
+
+async def _should_persist_transcripts(session_id: Optional[str]) -> bool:
+    """Determine if transcripts should be persisted.
+
+    Precedence:
+      1) Global env toggle PERSIST_TRANSCRIPTS_ENABLED (default: 0/disabled)
+      2) If Convex is configured, check session.state.transcriptsPersistOptOut
+    """
+    enabled = os.getenv("PERSIST_TRANSCRIPTS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return False
+    if not session_id:
+        return False
+    # If Convex absent, we cannot check opt-out but still respect global toggle
+    if not _convex_base_url():
+        return enabled
+    try:
+        doc = await _get_session_doc(session_id)
+        state = (doc or {}).get("state") if isinstance(doc, dict) else None
+        if isinstance(state, dict) and bool(state.get("transcriptsPersistOptOut")):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+async def _persist_interaction_if_configured(
+    session_id: Optional[str],
+    group_id: Optional[str],
+    message_id: Optional[str],
+    role: Optional[str],
+    content: Optional[str],
+    ts_ms: Optional[int],
+) -> None:
+    try:
+        if not await _should_persist_transcripts(session_id):
+            return
+        if not (session_id and group_id and message_id and role and ts_ms and ts_ms > 0):
+            return
+        text = (content or "")
+        # contentHash required by Convex schema
+        ch = _sha256_hex(f"{role}|{text}")
+        args = {
+            "sessionId": session_id,
+            "groupId": group_id,
+            "messageId": message_id,
+            "role": "assistant" if role == "assistant" else "user",
+            "contentHash": ch,
+            "text": text,
+            "audioUrl": None,
+            "ts": int(ts_ms),
+        }
+        await _convex_mutation("functions/interactions:appendInteraction", args)
+    except Exception:
+        # Best-effort; never fail caller
+        pass
+
+
+async def _fetch_transcript_events_for_context(
+    session_id: Optional[str],
+    group_id: Optional[str],
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch recent transcript events to include in chat context.
+
+    If CHAT_CONTEXT_FROM_CONVEX=1 and Convex is configured, fetch via interactions queries.
+    Otherwise, fall back to in-memory transcripts and optional span slicing when group_id provided.
+    """
+    # Resolve default limit from environment if not provided, and clamp
+    if not isinstance(limit, int) or limit <= 0:
+        limit = _chat_context_limit_default()
+    else:
+        limit = max(1, min(200, limit))
+    out: List[Dict[str, Any]] = []
+    use_convex = os.getenv("CHAT_CONTEXT_FROM_CONVEX", "0").strip().lower() in ("1", "true", "yes", "on")
+    if use_convex and _convex_base_url() and session_id:
+        try:
+            if group_id:
+                data = await _convex_query("functions/interactions:listByGroup", {"groupId": group_id, "limit": max(1, min(200, limit))})
+            else:
+                data = await _convex_query("functions/interactions:listBySession", {"sessionId": session_id, "limit": max(1, min(200, limit))})
+            docs = (data or {}).get("value") if isinstance(data, dict) else None
+            if isinstance(docs, list):
+                for d in docs[-limit:]:
+                    if isinstance(d, dict):
+                        out.append({
+                            "role": d.get("role"),
+                            "content": d.get("text") or "",
+                            "ts": d.get("ts") or d.get("createdAt"),
+                        })
+                return out
+        except Exception:
+            out = []
+    # Fallback to in-memory
+    try:
+        transcripts: Dict[str, List[Dict[str, Any]]] = app.state.session_transcripts  # type: ignore[attr-defined]
+        events = transcripts.get(session_id or "", []) or []
+        if group_id:
+            spans: Dict[Tuple[str, str], Dict[str, int]] = app.state.group_spans  # type: ignore[attr-defined]
+            span = spans.get((session_id or "", group_id), {}) or {}
+            s = span.get("start_index", 0)
+            e = span.get("end_index", len(events))
+            if s < 0:
+                s = 0
+            if e is None or e > len(events):
+                e = len(events)
+            if e < s:
+                e = s
+            events = events[s:e]
+        # Keep last N
+        events = events[-limit:]
+        out = [{"role": ev.get("role"), "content": ev.get("content") or "", "ts": ev.get("ts")} for ev in events]
+    except Exception:
+        out = []
+    return out
+
+
+def _aggregate_scores(skill_results: List[Dict[str, Any]]) -> Tuple[List[str], Dict[str, float]]:
+    """Aggregate categories and scores across per-skill results via simple average.
+
+    Returns (categories, scores).
+    """
+    if not skill_results:
+        return RUBRIC_V1_CATEGORIES, {}
+    # Union categories
+    cat_set: Set[str] = set()
+    for r in skill_results:
+        for c in (r.get("categories") or []):
+            if isinstance(c, str) and c:
+                cat_set.add(c)
+    categories = sorted(cat_set) if cat_set else RUBRIC_V1_CATEGORIES
+    # Average scores where present
+    sums: Dict[str, float] = {c: 0.0 for c in categories}
+    counts: Dict[str, int] = {c: 0 for c in categories}
+    for r in skill_results:
+        sc = r.get("scores") or {}
+        if isinstance(sc, dict):
+            for k, v in sc.items():
+                if k in sums:
+                    try:
+                        x = float(v)
+                    except Exception:
+                        continue
+                    sums[k] += x
+                    counts[k] += 1
+    agg: Dict[str, float] = {}
+    for c in categories:
+        n = counts.get(c, 0)
+        if n > 0:
+            agg[c] = round(sums[c] / n, 3)
+    return categories, agg
+
 async def _run_assessment_job(
     session_id: str,
     group_id: str,
     request_id: Optional[str],
-    rubric_version: str = "v1",
+    rubric_version: str = "v2",
     return_summary: bool = False,
     tracked_hash: Optional[str] = None,
 ):
@@ -528,21 +966,263 @@ async def _run_assessment_job(
             end_idx = start_idx
         slice_events = events[start_idx:end_idx]
 
-        # Deterministic seed from actual content when available; fallback to ids
-        if slice_events:
-            concat = "\n".join(f"{e.get('role','')}|{e.get('content','')}" for e in slice_events).encode("utf-8")
-            seed_bytes = hashlib.sha256(concat).digest()
-        else:
-            seed_bytes = hashlib.sha256(f"{session_id}:{group_id}".encode("utf-8")).digest()
-        h_base = int.from_bytes(seed_bytes[:4], "big") % 1000
-        for i, cat in enumerate(RUBRIC_V1_CATEGORIES):
-            scores[cat] = round(((h_base + (i * 73)) % 1000) / 1000.0, 2)
+        # If assess provider is enabled, attempt provider-based assessment first.
+        # Fallback to deterministic stub if provider is disabled or fails.
+        provider_succeeded = False
+        use_provider = os.getenv("AI_ASSESS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+        if use_provider:
+            try:
+                client = get_assess_client()
+                provider_name = getattr(client, "provider_name", "unknown")
+                model_name = getattr(client, "model", "unknown")
+                # Build minimal transcript for provider [ {role, content}, ... ]
+                transcript = [
+                    {"role": (e.get("role") or ""), "content": (e.get("content") or "")}
+                    for e in slice_events
+                ]
+                # Fetch tracked skills for this session
+                skills = await _get_tracked_skills_for_session(session_id)
+                if skills:
+                    # Fan out concurrent assessment calls per skill with per-call and group timeouts
+                    async def _call_one(skill_obj: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str], float]:
+                        t1 = time.perf_counter()
+                        try:
+                            res = await asyncio.wait_for(
+                                client.assess(transcript, rubric_version=rubric_version, request_id=request_id, skill=skill_obj),
+                                timeout=max(0.001, ASSESS_PER_SKILL_TIMEOUT_MS / 1000.0),
+                            )
+                            dt = time.perf_counter() - t1
+                            return res or {}, None, dt
+                        except asyncio.TimeoutError:
+                            dt = time.perf_counter() - t1
+                            return {}, "timeout", dt
+                        except Exception as e:  # pragma: no cover - provider error handling
+                            dt = time.perf_counter() - t1
+                            return {}, str(e), dt
 
-        # Optionally build deterministic summary from the same slice using the helper
-        if return_summary:
-            summary_obj = _compute_rubric_v1_summary_from_spans(
-                session_id, group_id, scores, rubric_version=rubric_version
-            )
+                    # Create tasks so we can enforce a group deadline
+                    task_map: Dict[asyncio.Task, Tuple[int, Dict[str, Any]]] = {}
+                    for idx, s in enumerate(skills):
+                        t = asyncio.create_task(_call_one(s))
+                        task_map[t] = (idx, s)
+                    done, pending = await asyncio.wait(task_map.keys(), timeout=max(0.001, ASSESS_GROUP_TIMEOUT_MS / 1000.0))
+                    # Collect results in original skill order
+                    results_list: List[Tuple[Dict[str, Any], Optional[str], float]] = [({}, "group_timeout", 0.0)] * len(skills)
+                    for t in done:
+                        idx, _s = task_map[t]
+                        try:
+                            results_list[idx] = t.result()
+                        except Exception as e:
+                            results_list[idx] = ({}, str(e), 0.0)
+                    for t in pending:
+                        # Cancel pending tasks and mark as group timeout
+                        try:
+                            t.cancel()
+                        except Exception:
+                            pass
+                    skill_assessments: List[Dict[str, Any]] = []
+                    skill_errors: List[Dict[str, Any]] = []
+                    ok_results: List[Dict[str, Any]] = []
+                    for s, (res, err, dt) in zip(skills, results_list):
+                        sid = str(s.get("id") or "").strip()
+                        sid_hash = _skill_hash(sid)
+                        if err is not None:
+                            # Metrics and logs for error
+                            try:
+                                reason = "timeout" if err in ("timeout", "group_timeout") else "exception"
+                                ASSESS_SKILL_ERRORS_TOTAL.labels(provider=provider_name, model=model_name, reason=reason).inc()
+                            except Exception:
+                                pass
+                            try:
+                                logger.info(json.dumps({
+                                    "event": "assessment_skill_error",
+                                    "requestId": request_id,
+                                    "trackedSkillIdHash": tracked_hash,
+                                    "skillId": sid or None,
+                                    "skillHash": sid_hash,
+                                    "sessionId": session_id,
+                                    "groupId": group_id,
+                                    "error": err,
+                                }))
+                            except Exception:
+                                pass
+                            # Capture per-skill error for group summary
+                            skill_errors.append({
+                                "skill": {k: s.get(k) for k in ("id", "name", "category") if k in s},
+                                "error": err,
+                            })
+                            continue
+                        # Success
+                        try:
+                            ASSESS_SKILL_SECONDS.labels(provider=provider_name, model=model_name, rubric_version=rubric_version).observe(dt)
+                        except Exception:
+                            pass
+                        try:
+                            logger.info(json.dumps({
+                                "event": "assessment_skill_complete",
+                                "requestId": request_id,
+                                "trackedSkillIdHash": tracked_hash,
+                                "skillId": sid or None,
+                                "skillHash": sid_hash,
+                                "sessionId": session_id,
+                                "groupId": group_id,
+                                "latency_ms": int(dt * 1000),
+                            }))
+                        except Exception:
+                            pass
+                        skill_assessments.append({
+                            "skill": {k: s.get(k) for k in ("id", "name", "category") if k in s},
+                            "result": res,
+                        })
+                        ok_results.append(res)
+
+                    if ok_results:
+                        cats, agg_scores = _aggregate_scores(ok_results)
+                        scores = agg_scores
+                        if return_summary:
+                            # Build an overall summary with per-skill details attached
+                            highlights: List[str] = []
+                            recommendations: List[str] = []
+                            for r in ok_results:
+                                for h in (r.get("highlights") or []):
+                                    if isinstance(h, str) and h.strip():
+                                        highlights.append(h.strip())
+                                for rec in (r.get("recommendations") or []):
+                                    if isinstance(rec, str) and rec.strip():
+                                        recommendations.append(rec.strip())
+                            # Stable ordering by skill id
+                            try:
+                                skill_assessments.sort(key=lambda it: str(((it or {}).get("skill") or {}).get("id") or ""))
+                                skill_errors.sort(key=lambda it: str(((it or {}).get("skill") or {}).get("id") or ""))
+                            except Exception:
+                                pass
+                            # Aggregate optional tokens/cost/latency
+                            tokens_in = 0
+                            tokens_out = 0
+                            cost_usd = 0.0
+                            latency_ms_total = 0
+                            for item in skill_assessments:
+                                m = ((item.get("result") or {}).get("meta") or {}) if isinstance(item.get("result"), dict) else {}
+                                try:
+                                    ti = int(m.get("tokensIn") or m.get("promptTokens") or 0)
+                                except Exception:
+                                    ti = 0
+                                try:
+                                    to = int(m.get("tokensOut") or m.get("completionTokens") or 0)
+                                except Exception:
+                                    to = 0
+                                try:
+                                    c = float(m.get("costUsd") or 0.0)
+                                except Exception:
+                                    c = 0.0
+                                try:
+                                    lm = int(m.get("latencyMs") or 0)
+                                except Exception:
+                                    lm = 0
+                                tokens_in += max(0, ti)
+                                tokens_out += max(0, to)
+                                cost_usd += max(0.0, c)
+                                latency_ms_total += max(0, lm)
+                            summary_obj = {
+                                "rubricVersion": rubric_version,
+                                "categories": cats,
+                                "scores": scores,
+                                "highlights": (highlights[:3] or ["placeholder"]),
+                                "recommendations": (recommendations[:3] or ["placeholder"]),
+                                "meta": {
+                                    "provider": provider_name,
+                                    "model": model_name,
+                                    "skillsCount": len(skill_assessments),
+                                    "tokensIn": tokens_in or None,
+                                    "tokensOut": tokens_out or None,
+                                    "costUsd": round(cost_usd, 6) if cost_usd else None,
+                                    "latencyMsTotal": latency_ms_total or None,
+                                },
+                                "skillAssessments": skill_assessments,
+                                "errors": skill_errors,
+                            }
+                            # Emit aggregated token/cost metrics for observability
+                            try:
+                                if tokens_in:
+                                    ASSESS_TOKENS_TOTAL.labels(
+                                        direction="in",
+                                        provider=provider_name,
+                                        model=model_name,
+                                        rubric_version=rubric_version,
+                                    ).inc(tokens_in)
+                                if tokens_out:
+                                    ASSESS_TOKENS_TOTAL.labels(
+                                        direction="out",
+                                        provider=provider_name,
+                                        model=model_name,
+                                        rubric_version=rubric_version,
+                                    ).inc(tokens_out)
+                                if cost_usd:
+                                    ASSESS_COST_USD_TOTAL.labels(
+                                        provider=provider_name,
+                                        model=model_name,
+                                        rubric_version=rubric_version,
+                                    ).inc(cost_usd)
+                            except Exception:
+                                pass
+                            provider_succeeded = True
+                else:
+                    # No skills tracked -> single provider call (back-compat)
+                    result = await client.assess(transcript, rubric_version=rubric_version, request_id=request_id)
+                    prov_scores = dict((result or {}).get("scores") or {})
+                    if prov_scores:
+                        scores = {k: float(v) for k, v in prov_scores.items() if isinstance(v, (int, float, str))}
+                        if return_summary:
+                            summary_obj = result or {}
+                            # Emit token/cost metrics when provided by provider meta
+                            try:
+                                m = dict((summary_obj.get("meta") or {}))
+                                ti = int(m.get("tokensIn") or m.get("promptTokens") or 0)
+                                to = int(m.get("tokensOut") or m.get("completionTokens") or 0)
+                                c = float(m.get("costUsd") or 0.0)
+                                if ti:
+                                    ASSESS_TOKENS_TOTAL.labels(
+                                        direction="in",
+                                        provider=provider_name,
+                                        model=model_name,
+                                        rubric_version=rubric_version,
+                                    ).inc(ti)
+                                if to:
+                                    ASSESS_TOKENS_TOTAL.labels(
+                                        direction="out",
+                                        provider=provider_name,
+                                        model=model_name,
+                                        rubric_version=rubric_version,
+                                    ).inc(to)
+                                if c:
+                                    ASSESS_COST_USD_TOTAL.labels(
+                                        provider=provider_name,
+                                        model=model_name,
+                                        rubric_version=rubric_version,
+                                    ).inc(c)
+                            except Exception:
+                                pass
+                        provider_succeeded = True
+            except Exception:
+                # Any provider error -> fall back to deterministic path
+                provider_succeeded = False
+
+        # Deterministic seed from actual content when available; fallback to ids
+        if not provider_succeeded and not scores:
+            if slice_events:
+                concat = "\n".join(f"{e.get('role','')}|{e.get('content','')}" for e in slice_events).encode("utf-8")
+                seed_bytes = hashlib.sha256(concat).digest()
+            else:
+                seed_bytes = hashlib.sha256(f"{session_id}:{group_id}".encode("utf-8")).digest()
+            h_base = int.from_bytes(seed_bytes[:4], "big") % 1000
+            for i, cat in enumerate(RUBRIC_V1_CATEGORIES):
+                scores[cat] = round(((h_base + (i * 73)) % 1000) / 1000.0, 2)
+
+            # Optionally build deterministic summary from the same slice using the helper
+            if return_summary:
+                summary_obj = _compute_rubric_v1_summary_from_spans(
+                    session_id, group_id, scores, rubric_version=rubric_version
+                )
         try:
             logger.info(
                 json.dumps(
@@ -802,7 +1482,7 @@ async def _assessments_worker_sqs(app: FastAPI, worker_index: int = 0):
                         scores, summary_obj = res
                     else:
                         scores = res
-                        summary_obj = _compute_rubric_v1_summary_from_spans(session_id, group_id, scores, rubric_version="v1")
+                        summary_obj = _compute_rubric_v1_summary_from_spans(session_id, group_id, scores, rubric_version="v2")
                     # Persist results (same as in-memory worker)
                     app.state.assessment_results[session_id] = {  # type: ignore[attr-defined]
                         "latestGroupId": group_id,
@@ -814,18 +1494,8 @@ async def _assessments_worker_sqs(app: FastAPI, worker_index: int = 0):
                         pass
                     # Optional HTTP persistence callback
                     try:
-                        summary_for_persist = {
-                            "highlights": summary_obj.get("highlights", []) or ["placeholder"],
-                            "recommendations": summary_obj.get("recommendations", []) or ["placeholder"],
-                            "categories": summary_obj.get("categories", RUBRIC_V1_CATEGORIES),
-                            "scores": scores,
-                            "meta": summary_obj.get("meta", {}),
-                            "rubricVersion": summary_obj.get("rubricVersion", "v1"),
-                            "rubricKeyPoints": [
-                                f"{cat}:{scores.get(cat)}" for cat in RUBRIC_V1_CATEGORIES
-                            ],
-                        }
-                        await _persist_assessment_if_configured(session_id, group_id, summary_for_persist, "v1", request_id)
+                        v2_payload = _build_v2_persist_payload(summary_obj or {}, scores)
+                        await _persist_assessment_if_configured(session_id, group_id, v2_payload, "v2", request_id)
                     except Exception:
                         pass
                     # Delete message on success
@@ -913,6 +1583,24 @@ def _env_bool(name: str, default: bool) -> bool:
 WORKER_CONCURRENCY = _env_int("WORKER_CONCURRENCY", 2)
 ASSESSMENTS_MAX_RETRIES = _env_int("ASSESSMENTS_MAX_RETRIES", 3)
 ASSESSMENTS_BACKOFF_BASE_MS = _env_int("ASSESSMENTS_BACKOFF_BASE_MS", 200)
+# Timeouts
+ASSESS_PER_SKILL_TIMEOUT_MS = _env_int("ASSESS_PER_SKILL_TIMEOUT_MS", 8000)
+ASSESS_GROUP_TIMEOUT_MS = _env_int("ASSESS_GROUP_TIMEOUT_MS", 15000)
+
+# Hashing salt for skill IDs
+SKILL_HASH_SALT = os.getenv("SKILL_HASH_SALT", "").strip()
+
+def _skill_hash(skill_id: Optional[str]) -> Optional[str]:
+    try:
+        sid = (skill_id or "").strip()
+        if not sid:
+            return None
+        data = (SKILL_HASH_SALT + sid).encode("utf-8") if SKILL_HASH_SALT else sid.encode("utf-8")
+        return hashlib.sha256(data).hexdigest()
+    except Exception:
+        return None
+
+ 
 
 # Queue provider (Phase 2) — SQS feature flag and configuration
 USE_SQS = _env_bool("USE_SQS", False)
@@ -923,6 +1611,50 @@ AWS_ENDPOINT_URL_SQS = os.getenv("AWS_ENDPOINT_URL_SQS", "").strip()
 # Optional persistence callback (HTTP)
 PERSIST_ASSESSMENTS_URL = os.getenv("PERSIST_ASSESSMENTS_URL", "").strip()
 PERSIST_ASSESSMENTS_SECRET = os.getenv("PERSIST_ASSESSMENTS_SECRET", "").strip()
+
+def _as_str_list(val: Any) -> List[str]:
+    out: List[str] = []
+    if isinstance(val, list):
+        for x in val:
+            if isinstance(x, str) and x.strip():
+                out.append(x.strip())
+    elif isinstance(val, str) and val.strip():
+        out.append(val.strip())
+    return out
+
+def _build_v2_persist_payload(summary: Dict[str, Any], scores: Dict[str, float]) -> Dict[str, Any]:
+    """Map current summary/result structure to the new skill-aligned v2 shape.
+
+    v2 minimal shape:
+      {
+        "skillAssessments": [
+          {"skillHash": str, "level": float?, "metCriteria": [], "unmetCriteria": [], "feedback": []}
+        ],
+        "meta": { provider, model, skillsCount }
+      }
+    """
+    skills_raw = summary.get("skillAssessments") or []
+    v2_items: List[Dict[str, Any]] = []
+    for it in skills_raw:
+        skill = (it or {}).get("skill") or {}
+        res = (it or {}).get("result") or {}
+        sid = str(skill.get("id") or "").strip()
+        v2_items.append({
+            "skillHash": _skill_hash(sid),
+            "level": res.get("level"),
+            "metCriteria": list(res.get("metCriteria") or []),
+            "unmetCriteria": list(res.get("unmetCriteria") or []),
+            "feedback": _as_str_list(res.get("feedback") or res.get("recommendations") or res.get("highlights") or []),
+        })
+    meta = summary.get("meta") or {}
+    return {
+        "skillAssessments": v2_items,
+        "meta": {
+            "provider": meta.get("provider"),
+            "model": meta.get("model"),
+            "skillsCount": meta.get("skillsCount"),
+        },
+    }
 
 async def _persist_assessment_if_configured(
     session_id: str,
@@ -1018,7 +1750,7 @@ async def messages_ingest(request: Request):
     if not tracked_hash:
         try:
             _tsid = request.headers.get("x-tracked-skill-id")
-            tracked_hash = hashlib.sha256(_tsid.encode("utf-8")).hexdigest() if _tsid else None
+            tracked_hash = _skill_hash(_tsid) if _tsid else None
         except Exception:
             tracked_hash = None
     try:
@@ -1093,14 +1825,14 @@ async def messages_ingest(request: Request):
             client = get_classifier_client(model=_cls_model)
             cls_provider = getattr(client, "provider_name", None) or "unknown"
             cls_model = getattr(client, "model", None)
-            cls = await client.classify(role, content or "", turn_count)
+            cls = await client.classify(role, content or "", turn_count, request_id=request_id)
         except Exception:
             # Fallback to deterministic mock classifier
             try:
                 client = get_classifier_client(provider="mock", model=os.getenv("AI_CLASSIFIER_MODEL", "").strip() or None)
                 cls_provider = getattr(client, "provider_name", None) or "mock"
                 cls_model = getattr(client, "model", None)
-                cls = await client.classify(role, content or "", turn_count)
+                cls = await client.classify(role, content or "", turn_count, request_id=request_id)
             except Exception:
                 # Last resort: local stub
                 _cls_res = _classify_message_llm_stub(role, content or "", turn_count)
@@ -1140,11 +1872,9 @@ async def messages_ingest(request: Request):
             gid_now = session_state.get("groupId")
             if gid_now:
                 placeholder_summary = {
-                    "highlights": ["placeholder"],
-                    "recommendations": ["placeholder"],
-                    "rubricVersion": "v1",
-                    "categories": RUBRIC_V1_CATEGORIES,
-                    "scores": {},
+                    "rubricVersion": "v2",
+                    "skillAssessments": [],
+                    "meta": {"provider": "stub", "model": "stub", "skillsCount": 0},
                 }
                 app.state.assessment_results[session_id] = {  # type: ignore[attr-defined]
                     "latestGroupId": gid_now,
@@ -1172,11 +1902,9 @@ async def messages_ingest(request: Request):
             gid_now = session_state.get("groupId")
             if gid_now:
                 placeholder_summary = {
-                    "highlights": ["placeholder"],
-                    "recommendations": ["placeholder"],
-                    "rubricVersion": "v1",
-                    "categories": RUBRIC_V1_CATEGORIES,
-                    "scores": {},
+                    "rubricVersion": "v2",
+                    "skillAssessments": [],
+                    "meta": {"provider": "stub", "model": "stub", "skillsCount": 0},
                 }
                 app.state.assessment_results[session_id] = {  # type: ignore[attr-defined]
                     "latestGroupId": gid_now,
@@ -1249,18 +1977,8 @@ async def messages_ingest(request: Request):
                             pass
                         # Optional HTTP persistence callback
                         try:
-                            summary_for_persist = {
-                                "highlights": summary_obj.get("highlights", []) or ["placeholder"],
-                                "recommendations": summary_obj.get("recommendations", []) or ["placeholder"],
-                                "categories": summary_obj.get("categories", RUBRIC_V1_CATEGORIES),
-                                "scores": scores_sync,
-                                "meta": summary_obj.get("meta", {}),
-                                "rubricVersion": summary_obj.get("rubricVersion", "v1"),
-                                "rubricKeyPoints": [
-                                    f"{cat}:{scores_sync.get(cat)}" for cat in RUBRIC_V1_CATEGORIES
-                                ],
-                            }
-                            await _persist_assessment_if_configured(session_id, gid_now, summary_for_persist, "v1", request_id)
+                            v2_payload = _build_v2_persist_payload(summary_obj or {}, scores_sync)
+                            await _persist_assessment_if_configured(session_id, gid_now, v2_payload, "v2", request_id)
                         except Exception:
                             pass
                 except Exception:
@@ -1270,6 +1988,7 @@ async def messages_ingest(request: Request):
     elif decision == "one_off":
         # Enqueue single-turn assessment immediately
         gid = str(uuid.uuid4())
+        # placeholder removed
         # Record span as the single message for this one-off
         try:
             if evt_idx >= 0:
@@ -1318,18 +2037,8 @@ async def messages_ingest(request: Request):
                     pass
                 # Optional HTTP persistence callback
                 try:
-                    summary_for_persist = {
-                        "highlights": summary_obj.get("highlights", []) or ["placeholder"],
-                        "recommendations": summary_obj.get("recommendations", []) or ["placeholder"],
-                        "categories": summary_obj.get("categories", RUBRIC_V1_CATEGORIES),
-                        "scores": scores_sync,
-                        "meta": summary_obj.get("meta", {}),
-                        "rubricVersion": summary_obj.get("rubricVersion", "v1"),
-                        "rubricKeyPoints": [
-                            f"{cat}:{scores_sync.get(cat)}" for cat in RUBRIC_V1_CATEGORIES
-                        ],
-                    }
-                    await _persist_assessment_if_configured(session_id, gid, summary_for_persist, "v1", request_id)
+                    v2_payload = _build_v2_persist_payload(summary_obj or {}, scores_sync)
+                    await _persist_assessment_if_configured(session_id, gid, v2_payload, "v2", request_id)
                 except Exception:
                     pass
             except Exception:
@@ -1393,7 +2102,7 @@ async def assessments_run(request: Request):
     if not tracked_hash:
         try:
             _tsid = request.headers.get("x-tracked-skill-id")
-            tracked_hash = hashlib.sha256(_tsid.encode("utf-8")).hexdigest() if _tsid else None
+            tracked_hash = _skill_hash(_tsid) if _tsid else None
         except Exception:
             tracked_hash = None
     # Read raw body once and parse permissively
@@ -1483,6 +2192,11 @@ async def assessments_get(sessionId: str, request: Request):
             tracked_hash = hashlib.sha256(_tsid.encode("utf-8")).hexdigest() if _tsid else None
         except Exception:
             tracked_hash = None
+    # Raw skill id header (used for response-level filtering)
+    try:
+        tsid = request.headers.get("x-tracked-skill-id")
+    except Exception:
+        tsid = None
     try:
         logger.info(json.dumps({
             "event": "assessments_get_lookup",
@@ -1496,21 +2210,19 @@ async def assessments_get(sessionId: str, request: Request):
         pass
     if decoded_id in results or sessionId in results:
         data = results.get(decoded_id) or results.get(sessionId)
-        return {"sessionId": sessionId, **data}
+        # Apply response-level filtering when a specific tracked skill id is provided
+        if tsid:
+            try:
+                summ_in = (data or {}).get("summary") or {}
+                summ_out = _filter_summary_by_skill_id(summ_in, tsid)
+                return {"sessionId": sessionId, **{**(data or {}), "summary": summ_out}}
+            except Exception:
+                pass
+        return {"sessionId": sessionId, **(data or {})}
     # If not found, attempt to compute on-demand using last known groupId from session state
     try:
         ss_map: Dict[str, Dict[str, Any]] = getattr(app.state, "session_state", {})  # type: ignore[attr-defined]
         session_state: Dict[str, Any] = ss_map.get(decoded_id) or ss_map.get(sessionId)
-        try:
-            logger.info(json.dumps({
-                "event": "assessments_get_state",
-                "trackedSkillIdHash": tracked_hash,
-                "has_state_decoded": bool(ss_map.get(decoded_id)),
-                "has_state_raw": bool(ss_map.get(sessionId)),
-                "groupId": (session_state or {}).get("groupId") if session_state else None,
-            }))
-        except Exception:
-            pass
     except Exception:
         session_state = None  # type: ignore[assignment]
     if session_state and session_state.get("groupId"):
@@ -1524,7 +2236,12 @@ async def assessments_get(sessionId: str, request: Request):
             }
         except Exception:
             pass
-        return {"sessionId": sessionId, "latestGroupId": gid, "summary": summary_obj}
+        # Return filtered view per caller request, but persist full summary above
+        try:
+            resp_summary = _filter_summary_by_skill_id(summary_obj, tsid) if tsid else summary_obj
+        except Exception:
+            resp_summary = summary_obj
+        return {"sessionId": sessionId, "latestGroupId": gid, "summary": resp_summary}
     # Fallback stub response (ensure shape and optionally echo last known groupId)
     try:
         ss_map2: Dict[str, Dict[str, Any]] = getattr(app.state, "session_state", {})  # type: ignore[attr-defined]
@@ -1535,17 +2252,15 @@ async def assessments_get(sessionId: str, request: Request):
         "sessionId": sessionId,
         "latestGroupId": session_state_fallback.get("groupId") if session_state_fallback else None,
         "summary": {
-            "highlights": ["placeholder"],
-            "recommendations": ["placeholder"],
-            "rubricVersion": "v1",
-            "categories": RUBRIC_V1_CATEGORIES,
-            "scores": {},
+            "rubricVersion": "v2",
+            "skillAssessments": [],
+            "meta": {"provider": "stub", "model": "stub", "skillsCount": 0},
         },
     }
 
 
-@app.get("/metrics", tags=["meta"], description="Lightweight service metrics for observability.")
-async def metrics():
+@app.get("/service-metrics", tags=["meta"], description="Lightweight service metrics for observability.")
+async def service_metrics():
     try:
         queue: asyncio.Queue = app.state.assessment_queue  # type: ignore[attr-defined]
         workers = getattr(app.state, "assessment_worker_tasks", [])  # type: ignore[attr-defined]

@@ -33,7 +33,7 @@ def test_assessments_run_and_get_flow():
         assert payload.get("latestGroupId") == group_id
         summary = payload.get("summary")
         assert summary is not None
-        assert summary.get("rubricVersion") == "v1"
+        assert summary.get("rubricVersion") == "v2"
         assert summary.get("categories") == RUBRIC_V1_CATEGORIES
         scores = summary.get("scores")
         assert isinstance(scores, dict)
@@ -53,7 +53,7 @@ def test_assessments_run_requires_session_id():
         assert body.get("detail") == "sessionId required"
 
 
-def test_rubric_v1_deterministic_hashing():
+def test_rubric_deterministic_hashing():
     # Calling the internal job twice with the same (sessionId, groupId)
     # should yield the same set of scores.
     import app.main as main
