@@ -18,7 +18,17 @@ import os
 import hashlib
 import base64
 from contextlib import asynccontextmanager
+import io
+import wave
 import httpx
+
+# Load environment variables from .env if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 try:
     from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
     METRICS_ENABLED = True
@@ -195,6 +205,8 @@ async def lifespan(app: FastAPI):
     app.state.session_transcripts = {}  # type: ignore[attr-defined]
     # Keyed by (sessionId, groupId) -> {"start_index": int, "end_index": int}
     app.state.group_spans = {}  # type: ignore[attr-defined]
+    # In-memory TTS audio store for benchmarking stub
+    app.state.tts_audio = {}  # type: ignore[attr-defined]
     # Initialize queue depth gauge for in-memory provider
     try:
         QUE_DEPTH.labels(provider="memory").set(app.state.assessment_queue.qsize())  # type: ignore[attr-defined]
@@ -408,14 +420,36 @@ async def chat_stream(
     # Debug: log provider configuration
     logger.info(f"[DEBUG] AI_CHAT_ENABLED={_enabled}, AI_CHAT_MODEL={_model}")
 
+    # Pre-resolve provider/model so we can emit reliable headers on the response
+    client_outer = None
+    if _enabled:
+        try:
+            client_outer = get_chat_client(model=_model)
+            provider_name = getattr(client_outer, "provider_name", None) or provider_name
+            model_name = getattr(client_outer, "model", None) or model_name
+        except Exception:
+            client_outer = None
+
     async def instrumented_stream():
         nonlocal first_token_s
         nonlocal provider_name
         nonlocal model_name
         try:
+            # Define stub stream upfront so provider fallback can reuse it safely
+            async def _stub_stream():
+                yield "data: Hello! I'm in stub mode.\n\n"
+                await asyncio.sleep(0.05)
+                yield "data: Chat functionality is disabled.\n\n"
+                await asyncio.sleep(0.05)
+                yield "data: Set AI_CHAT_ENABLED=1 to enable real chat.\n\n"
+                await asyncio.sleep(0.15)
+                yield "data: [DONE]\n\n"
+
+            _token_stream = None
+            provider_setup_error: Optional[str] = None
             if _enabled:
                 try:
-                    client = get_chat_client(model=_model)
+                    client = client_outer or get_chat_client(model=_model)
                     provider_name = getattr(client, "provider_name", None) or "unknown"
                     model_name = getattr(client, "model", None)
                     # Build context from client-passed history when available; otherwise fallback to server transcripts.
@@ -437,7 +471,7 @@ async def chat_stream(
                                     limit = _chat_context_limit_default()
                                 except Exception:
                                     limit = 10
-                                items = arr[-max(1, min(200, limit)):]
+                                items = arr[-max(1, min(200, limit)) :]
                                 lines: List[str] = []
                                 for it in items:
                                     if not isinstance(it, dict):
@@ -456,10 +490,14 @@ async def chat_stream(
                                     ctx_source = "client"
                         except Exception:
                             pass
-                    # Fallback to server-side transcript summary when client history not present/invalid
+                    # Fallback to server-side transcript summary when client history not present/invalid (with timeout)
                     if not ctx and sid:
                         try:
-                            ctx = await _build_classifier_context_summary(sid)
+                            _timeout_s = float(os.getenv("AI_CHAT_PROMPT_TIMEOUT_SECONDS", "2.0"))
+                        except Exception:
+                            _timeout_s = 2.0
+                        try:
+                            ctx = await asyncio.wait_for(_build_classifier_context_summary(sid), timeout=_timeout_s)
                             if ctx:
                                 ctx_source = "server"
                         except Exception:
@@ -467,8 +505,15 @@ async def chat_stream(
                             ctx_source = "none"
                     infused = (f"ctx: {ctx}\nmsg: {prompt or ''}" if ctx else (prompt or ""))
                     
-                    # Build system prompt with speech coaching context and tracked skills
-                    system_prompt = await _build_system_prompt(sid)
+                    # Build system prompt with speech coaching context and tracked skills (with timeout)
+                    try:
+                        _timeout_s = float(os.getenv("AI_CHAT_PROMPT_TIMEOUT_SECONDS", "2.0"))
+                    except Exception:
+                        _timeout_s = 2.0
+                    try:
+                        system_prompt = await asyncio.wait_for(_build_system_prompt(sid), timeout=_timeout_s)
+                    except Exception:
+                        system_prompt = ""
                     
                     # Debug: log exact prompt payload being sent to chat LLM (with context details)
                     try:
@@ -501,39 +546,107 @@ async def chat_stream(
                         logger.info(f"[DEBUG] User message (infused): {infused}")
                     except Exception:
                         pass
-                    async for token in client.stream_chat(infused, system=system_prompt, request_id=request_id):
-                        chunk = f"data: {token}\n\n"
-                        if first_token_s is None:
-                            first_token_s = time.perf_counter() - start
+
+                    async def _provider_stream():
+                        nonlocal first_token_s
+                        # Implement TTFT timeout: if the first token takes too long, fall back to stub
+                        try:
                             try:
-                                logger.info(
+                                _ttft_timeout_s = float(os.getenv("AI_CHAT_TTFT_TIMEOUT_SECONDS", "5.0"))
+                            except Exception:
+                                _ttft_timeout_s = 5.0
+
+                            agen = client.stream_chat(infused, system=system_prompt, request_id=request_id).__aiter__()
+                            try:
+                                first_token = await asyncio.wait_for(agen.__anext__(), timeout=_ttft_timeout_s)
+                            except asyncio.TimeoutError:
+                                # Timeout waiting for first token — fall back to stub stream
+                                try:
+                                    logger.info(
+                                        json.dumps(
+                                            {
+                                                "event": "chat_stream_ttft_timeout",
+                                                "requestId": request_id,
+                                                "trackedSkillIdHash": tracked_hash,
+                                                "route": "/chat/stream",
+                                                "timeout_ms": int(_ttft_timeout_s * 1000),
+                                                "provider": provider_name,
+                                                "model": model_name,
+                                            }
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                                # Emit a small notice and switch to stub
+                                yield f"data: [provider timeout after {int(_ttft_timeout_s)}s, falling back]\n\n"
+                                async for chunk in _stub_stream():
+                                    yield chunk
+                                return
+                            except StopAsyncIteration:
+                                # Provider finished without tokens — treat as empty and finish
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            # We got the first token — record metrics and yield it
+                            chunk = f"data: {first_token}\n\n"
+                            if first_token_s is None:
+                                first_token_s = time.perf_counter() - start
+                                try:
+                                    logger.info(
+                                        json.dumps(
+                                            {
+                                                "event": "chat_stream_first_token",
+                                                "requestId": request_id,
+                                                "trackedSkillIdHash": tracked_hash,
+                                                "ttft_ms": int(first_token_s * 1000),
+                                                "route": "/chat/stream",
+                                                "prompt_present": bool(prompt),
+                                                "provider": provider_name,
+                                                "model": model_name,
+                                            }
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                                # Metrics: observe TTFT for provider path
+                                try:
+                                    CHAT_TTFT_SECONDS.labels(
+                                        provider=str(provider_name or "provider"),
+                                        model=str(model_name or "unknown"),
+                                    ).observe(first_token_s)
+                                except Exception:
+                                    pass
+                            yield chunk
+
+                            # Stream the rest
+                            async for token in agen:
+                                yield f"data: {token}\n\n"
+                            # End-of-stream marker
+                            yield "data: [DONE]\n\n"
+                        except Exception as e:
+                            # Any runtime error: notify client then fall back to stub stream
+                            try:
+                                logger.exception(
                                     json.dumps(
                                         {
-                                            "event": "chat_stream_first_token",
+                                            "event": "chat_stream_provider_runtime_error",
                                             "requestId": request_id,
                                             "trackedSkillIdHash": tracked_hash,
-                                            "ttft_ms": int(first_token_s * 1000),
                                             "route": "/chat/stream",
-                                            "prompt_present": bool(prompt),
                                             "provider": provider_name,
                                             "model": model_name,
+                                            "error": str(e),
                                         }
                                     )
                                 )
                             except Exception:
                                 pass
-                            # Metrics: observe TTFT for provider path
-                            try:
-                                CHAT_TTFT_SECONDS.labels(
-                                    provider=str(provider_name or "provider"),
-                                    model=str(model_name or "unknown"),
-                                ).observe(first_token_s)
-                            except Exception:
-                                pass
-                        yield chunk
-                    # End-of-stream marker
-                    yield "data: [DONE]\n\n"
-                    return
+                            # Emit a small notice with the error summary
+                            yield f"data: [provider runtime error: {str(e)[:240]}]\n\n"
+                            async for chunk in _stub_stream():
+                                yield chunk
+
+                    _token_stream = _provider_stream
                 except Exception as e:
                     # Log provider error and fall back to stub stream
                     try:
@@ -553,12 +666,14 @@ async def chat_stream(
                         )
                     except Exception:
                         pass
+                    provider_setup_error = str(e)
                     # Fallback to stub stream on any provider error
                     provider_name = provider_name or "fallback_stub"
                     model_name = model_name or None
-            else:
+
+            if _token_stream is None:
                 # Stub mode: return a simple response
-                provider_name = "stub"
+                provider_name = provider_name or "stub"
                 model_name = None
                 
                 # Build context and system prompt even in stub mode for debugging
@@ -579,7 +694,7 @@ async def chat_stream(
                                 limit = _chat_context_limit_default()
                             except Exception:
                                 limit = 10
-                            items = arr[-max(1, min(200, limit)):]
+                            items = arr[-max(1, min(200, limit)) :]
                             lines: List[str] = []
                             for it in items:
                                 if not isinstance(it, dict):
@@ -598,10 +713,14 @@ async def chat_stream(
                                 ctx_source = "client"
                     except Exception:
                         pass
-                # Fallback to server-side transcript summary when client history not present/invalid
+                # Fallback to server-side transcript summary when client history not present/invalid (with timeout)
                 if not ctx and sid:
                     try:
-                        ctx = await _build_classifier_context_summary(sid)
+                        _timeout_s = float(os.getenv("AI_CHAT_PROMPT_TIMEOUT_SECONDS", "2.0"))
+                    except Exception:
+                        _timeout_s = 2.0
+                    try:
+                        ctx = await asyncio.wait_for(_build_classifier_context_summary(sid), timeout=_timeout_s)
                         if ctx:
                             ctx_source = "server"
                     except Exception:
@@ -609,8 +728,15 @@ async def chat_stream(
                         ctx_source = "none"
                 infused = (f"ctx: {ctx}\nmsg: {prompt or ''}" if ctx else (prompt or ""))
                 
-                # Build system prompt with speech coaching context and tracked skills
-                system_prompt = await _build_system_prompt(sid)
+                # Build system prompt with speech coaching context and tracked skills (with timeout)
+                try:
+                    _timeout_s = float(os.getenv("AI_CHAT_PROMPT_TIMEOUT_SECONDS", "2.0"))
+                except Exception:
+                    _timeout_s = 2.0
+                try:
+                    system_prompt = await asyncio.wait_for(_build_system_prompt(sid), timeout=_timeout_s)
+                except Exception:
+                    system_prompt = ""
                 
                 # Debug: log full system prompt and user message content (even in stub mode)
                 try:
@@ -619,13 +745,14 @@ async def chat_stream(
                 except Exception:
                     pass
                 
-                async def _token_stream():
-                    yield "Hello! I'm in stub mode. "
-                    await asyncio.sleep(0.05)
-                    yield "Chat functionality is disabled. "
-                    await asyncio.sleep(0.05)
-                    yield "Set AI_CHAT_ENABLED=1 to enable real chat."
-                    await asyncio.sleep(0.15)
+                async def _stub_with_reason():
+                    if provider_setup_error:
+                        yield f"data: [provider setup error: {provider_setup_error}]\n\n"
+                        await asyncio.sleep(0.01)
+                    async for chunk in _stub_stream():
+                        yield chunk
+
+                _token_stream = _stub_with_reason
             async for chunk in _token_stream():
                 if first_token_s is None:
                     first_token_s = time.perf_counter() - start
@@ -684,11 +811,153 @@ async def chat_stream(
             except Exception:
                 pass
 
+    # Ensure header values are sane even before the stream starts
+    if not _enabled and not provider_name:
+        provider_name = "stub"
+        model_name = None
     resp = StreamingResponse(instrumented_stream(), media_type="text/event-stream")
     if request_id:
         # Echo for clients/proxies that want to surface it
         resp.headers["X-Request-Id"] = str(request_id)
+    # Surface provider/model so benchmarks and clients can record them
+    if provider_name:
+        resp.headers["X-Chat-Provider"] = str(provider_name)
+    if model_name:
+        resp.headers["X-Chat-Model"] = str(model_name)
+    # SSE anti-buffering headers
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["Connection"] = "keep-alive"
+    # Disable nginx proxy buffering if present
+    resp.headers["X-Accel-Buffering"] = "no"
     return resp
+
+
+@app.post("/api/v1/tts", tags=["audio"], description="Stub TTS that returns a short WAV file URL for benchmarking.")
+async def tts_generate(
+    request: Request,
+    body: Dict[str, Any] = Body(..., description="JSON body with 'text' and optional 'sessionId'"),
+):
+    """Generate a short silent WAV and return a URL to fetch it.
+
+    This is a lightweight stub to unblock e2e benchmarks. It does not call a real TTS provider.
+    """
+    try:
+        text = str(body.get("text", ""))
+    except Exception:
+        text = ""
+    # If configured, proxy to the frontend Next.js TTS route for real synthesis
+    # Env:
+    # - TTS_PROXY_URL: e.g. http://localhost:3000/api/v1/tts
+    # - TTS_PROXY_AUTH: optional Authorization header value (e.g. "Bearer ...")
+    proxy_url = os.getenv("TTS_PROXY_URL")
+    if proxy_url:
+        try:
+            headers = {"content-type": "application/json"}
+            # Propagate request id when available for tracing
+            req_id = getattr(getattr(request, "state", object()), "request_id", None) or request.headers.get("x-request-id")
+            if req_id:
+                headers["x-request-id"] = str(req_id)
+            auth_header = os.getenv("TTS_PROXY_AUTH")
+            if auth_header:
+                headers["authorization"] = auth_header
+            payload = {
+                "text": text,
+                # Pass through optional fields if provided by caller
+                "voiceId": body.get("voiceId"),
+                "format": body.get("format"),
+                "sessionId": body.get("sessionId"),
+                "groupId": body.get("groupId"),
+                # Allow provider override passthrough when frontend permits it
+                "provider": body.get("provider"),
+            }
+            # Remove None to keep payload clean
+            payload = {k: v for k, v in payload.items() if v is not None}
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(str(proxy_url), json=payload, headers=headers)
+            if resp.status_code == 200:
+                # Return the frontend payload directly
+                return JSONResponse(resp.json())
+            else:
+                # Fall back to stub on non-200, but include proxy error info
+                try:
+                    err_text = resp.text
+                except Exception:
+                    err_text = ""
+                logging.getLogger("coach_up.ai.tts").warning(
+                    "tts_proxy_non_200 status=%s body=%s", resp.status_code, err_text[:512]
+                )
+        except Exception as e:
+            # Fall back to stub on proxy failure
+            try:
+                logging.getLogger("coach_up.ai.tts").exception("tts_proxy_error: %s", e)
+            except Exception:
+                pass
+
+    # Determine duration based on text length (bounded)
+    try:
+        base_s = 0.6
+        add_s = min(2.4, max(0.0, len(text) * 0.01))  # 10ms per char, capped
+        duration_s = max(0.5, min(3.0, base_s + add_s))
+    except Exception:
+        duration_s = 1.0
+
+    # Generate a mono 16-bit PCM WAV of silence at 16kHz
+    fr = 16000
+    sampwidth = 2
+    nframes = int(duration_s * fr)
+    buf = io.BytesIO()
+    try:
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(sampwidth)
+            w.setframerate(fr)
+            # Write silence
+            w.writeframes(b"\x00\x00" * nframes)
+        audio_bytes = buf.getvalue()
+    finally:
+        buf.close()
+
+    # Store in-memory and return a fetchable URL
+    audio_id = str(uuid.uuid4())
+    try:
+        store: Dict[str, bytes] = app.state.tts_audio  # type: ignore[attr-defined]
+    except Exception:
+        store = {}
+        try:
+            app.state.tts_audio = store  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    store[audio_id] = audio_bytes
+
+    # Absolute URL for the audio resource
+    try:
+        audio_url = str(request.url_for("tts_audio", audio_id=audio_id))
+    except Exception:
+        # Fallback to relative path
+        audio_url = f"/api/v1/tts/audio/{audio_id}.wav"
+
+    return JSONResponse({
+        "audioUrl": audio_url,
+        "durationMs": int(duration_s * 1000),
+        "provider": "stub",
+    })
+
+
+@app.get(
+    "/api/v1/tts/audio/{audio_id}.wav",
+    tags=["audio"],
+    name="tts_audio",
+    description="Serve previously generated stub TTS WAV bytes.",
+)
+async def tts_audio(audio_id: str):
+    try:
+        store: Dict[str, bytes] = app.state.tts_audio  # type: ignore[attr-defined]
+    except Exception:
+        store = {}
+    data = store.get(audio_id)
+    if not data:
+        return Response(status_code=404)
+    return Response(content=data, media_type="audio/wav")
 
 def _compute_rubric_v1_summary_from_spans(
     session_id: str,
