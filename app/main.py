@@ -16,6 +16,7 @@ import urllib.request
 import urllib.error
 import os
 import hashlib
+import base64
 from contextlib import asynccontextmanager
 import httpx
 try:
@@ -147,6 +148,30 @@ CHAT_TOTAL_SECONDS = Histogram(
     "coachup_chat_total_seconds",
     "Total chat streaming duration in seconds",
     ["provider", "model"],
+)
+
+# Transcript persistence & classifier context metrics
+TRANSCRIPT_PERSIST_TOTAL = Counter(
+    "coachup_transcript_persist_total",
+    "Transcript persistence outcomes",
+    ["outcome", "role"],
+)
+TRANSCRIPT_PERSIST_SECONDS = Histogram(
+    "coachup_transcript_persist_seconds",
+    "Duration of transcript persistence to Convex in seconds",
+)
+CLASSIFIER_CONTEXT_BUILD_TOTAL = Counter(
+    "coachup_classifier_context_build_total",
+    "Classifier context build outcomes",
+    ["outcome"],
+)
+CLASSIFIER_CONTEXT_MESSAGES = Histogram(
+    "coachup_classifier_context_messages",
+    "Number of messages included in classifier context",
+)
+CLASSIFIER_CONTEXT_LENGTH_CHARS = Histogram(
+    "coachup_classifier_context_length_chars",
+    "Length of classifier context string in characters",
 )
 
 # Rubric v1 categories (normalized [0,1])
@@ -357,6 +382,8 @@ async def _token_stream():
 async def chat_stream(
     request: Request,
     prompt: Optional[str] = Query(None, description="Optional user prompt for logging/testing"),
+    session_id: Optional[str] = Query(None, description="Optional session id to enable multi-turn context"),
+    history: Optional[str] = Query(None, description="Optional base64url-encoded JSON array of messages"),
 ):
     start = time.perf_counter()
     first_token_s: Optional[float] = None
@@ -388,7 +415,78 @@ async def chat_stream(
                     client = get_chat_client(model=_model)
                     provider_name = getattr(client, "provider_name", None) or "unknown"
                     model_name = getattr(client, "model", None)
-                    async for token in client.stream_chat(prompt or "", request_id=request_id):
+                    # Build context from client-passed history when available; otherwise fallback to server transcripts.
+                    # Accept both "sessionId" and "session_id" query keys for flexibility
+                    sid = session_id or request.query_params.get("session_id") or request.query_params.get("sessionId")
+                    ctx = ""
+                    ctx_source = "none"
+                    hist_b64 = request.query_params.get("history")
+                    # Try client-provided history (base64url JSON array of {role, content})
+                    if hist_b64:
+                        try:
+                            s = str(hist_b64)
+                            pad = "=" * (-len(s) % 4)
+                            decoded = base64.urlsafe_b64decode((s + pad).encode("utf-8")).decode("utf-8", errors="ignore")
+                            arr = json.loads(decoded)
+                            if isinstance(arr, list) and arr:
+                                # Limit number of messages for safety
+                                try:
+                                    limit = _chat_context_limit_default()
+                                except Exception:
+                                    limit = 10
+                                items = arr[-max(1, min(200, limit)):]
+                                lines: List[str] = []
+                                for it in items:
+                                    if not isinstance(it, dict):
+                                        continue
+                                    role = str((it.get("role") or "")).lower()
+                                    tag = "u" if role == "user" else ("a" if role == "assistant" else "?")
+                                    txt = str((it.get("content") or "")).replace("\n", " ").strip()
+                                    if len(txt) > 240:
+                                        txt = txt[:237] + "..."
+                                    if txt:
+                                        lines.append(f"{tag}: {txt}")
+                                ctx = "; ".join(lines)
+                                if len(ctx) > 2000:
+                                    ctx = ctx[:1997] + "..."
+                                if ctx:
+                                    ctx_source = "client"
+                        except Exception:
+                            pass
+                    # Fallback to server-side transcript summary when client history not present/invalid
+                    if not ctx and sid:
+                        try:
+                            ctx = await _build_classifier_context_summary(sid)
+                            if ctx:
+                                ctx_source = "server"
+                        except Exception:
+                            ctx = ""
+                            ctx_source = "none"
+                    infused = (f"ctx: {ctx}\nmsg: {prompt or ''}" if ctx else (prompt or ""))
+                    # Debug: log exact prompt payload being sent to chat LLM (with context details)
+                    try:
+                        logger.info(
+                            json.dumps(
+                                {
+                                    "event": "chat_stream_request",
+                                    "requestId": request_id,
+                                    "trackedSkillIdHash": tracked_hash,
+                                    "route": "/chat/stream",
+                                    "provider": provider_name,
+                                    "model": model_name,
+                                    "prompt": (prompt or ""),
+                                    "prompt_len": len(prompt or ""),
+                                    "ctx_present": bool(ctx),
+                                    "ctx_source": ctx_source,
+                                    "history_present": bool(hist_b64),
+                                    "ctx_len": len(ctx or ""),
+                                    "infused_len": len(infused),
+                                }
+                            )
+                        )
+                    except Exception:
+                        pass
+                    async for token in client.stream_chat(infused, request_id=request_id):
                         chunk = f"data: {token}\n\n"
                         if first_token_s is None:
                             first_token_s = time.perf_counter() - start
@@ -768,8 +866,16 @@ async def _should_persist_transcripts(session_id: Optional[str]) -> bool:
     """
     enabled = os.getenv("PERSIST_TRANSCRIPTS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     if not enabled:
+        try:
+            TRANSCRIPT_PERSIST_TOTAL.labels(outcome="disabled", role="unknown").inc()
+        except Exception:
+            pass
         return False
     if not session_id:
+        try:
+            TRANSCRIPT_PERSIST_TOTAL.labels(outcome="no_session", role="unknown").inc()
+        except Exception:
+            pass
         return False
     # If Convex absent, we cannot check opt-out but still respect global toggle
     if not _convex_base_url():
@@ -778,10 +884,90 @@ async def _should_persist_transcripts(session_id: Optional[str]) -> bool:
         doc = await _get_session_doc(session_id)
         state = (doc or {}).get("state") if isinstance(doc, dict) else None
         if isinstance(state, dict) and bool(state.get("transcriptsPersistOptOut")):
+            try:
+                TRANSCRIPT_PERSIST_TOTAL.labels(outcome="optout", role="unknown").inc()
+            except Exception:
+                pass
             return False
     except Exception:
         pass
     return True
+
+
+def _classifier_context_limit_default() -> int:
+    """Default number of recent messages to include in classifier context.
+
+    Reads CLASSIFIER_CONTEXT_LIMIT from env, clamps to [1, 50], defaults to 6.
+    """
+    try:
+        v = int((os.getenv("CLASSIFIER_CONTEXT_LIMIT") or "6").strip())
+    except Exception:
+        v = 6
+    if v < 1:
+        v = 1
+    if v > 50:
+        v = 50
+    return v
+
+
+async def _build_classifier_context_summary(session_id: Optional[str]) -> str:
+    """Build a brief plain-text context summary for the classifier.
+
+    Uses recent transcript events for the session (ignoring group boundaries) to
+    keep the interface simple and provider-agnostic.
+    """
+    try:
+        limit = _classifier_context_limit_default()
+        events = await _fetch_transcript_events_for_context(session_id, group_id=None, limit=limit)
+        # Render as compact lines: "u: text" / "a: text"
+        lines: List[str] = []
+        for ev in events:
+            role = (ev.get("role") or "").lower()
+            tag = "u" if role == "user" else ("a" if role == "assistant" else "?")
+            txt = (ev.get("content") or "").replace("\n", " ").strip()
+            if len(txt) > 240:
+                txt = txt[:237] + "..."
+            lines.append(f"{tag}: {txt}")
+        if not lines:
+            try:
+                CLASSIFIER_CONTEXT_BUILD_TOTAL.labels(outcome="empty").inc()
+            except Exception:
+                pass
+            return ""
+        context = "; ".join(lines)
+        # Hard cap to avoid overly long prompts to providers
+        if len(context) > 2000:
+            context = context[:1997] + "..."
+        # Debug: log built classifier context summary
+        try:
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "classifier_context_built",
+                        "sessionId": session_id,
+                        "limit": limit,
+                        "lines": lines,
+                        "context": context,
+                        "context_len": len(context),
+                    }
+                )
+            )
+        except Exception:
+            pass
+        # Metrics for context summary
+        try:
+            CLASSIFIER_CONTEXT_BUILD_TOTAL.labels(outcome="success").inc()
+            CLASSIFIER_CONTEXT_MESSAGES.observe(len(lines))
+            CLASSIFIER_CONTEXT_LENGTH_CHARS.observe(len(context))
+        except Exception:
+            pass
+        return context
+    except Exception:
+        try:
+            CLASSIFIER_CONTEXT_BUILD_TOTAL.labels(outcome="error").inc()
+        except Exception:
+            pass
+        return ""
 
 
 async def _persist_interaction_if_configured(
@@ -795,14 +981,18 @@ async def _persist_interaction_if_configured(
     try:
         if not await _should_persist_transcripts(session_id):
             return
-        if not (session_id and group_id and message_id and role and ts_ms and ts_ms > 0):
+        # Allow session-only persistence: group_id is optional
+        if not (session_id and message_id and role and ts_ms and ts_ms > 0):
+            try:
+                TRANSCRIPT_PERSIST_TOTAL.labels(outcome="invalid_args", role=str(role or "unknown")).inc()
+            except Exception:
+                pass
             return
         text = (content or "")
         # contentHash required by Convex schema
         ch = _sha256_hex(f"{role}|{text}")
         args = {
             "sessionId": session_id,
-            "groupId": group_id,
             "messageId": message_id,
             "role": "assistant" if role == "assistant" else "user",
             "contentHash": ch,
@@ -810,7 +1000,26 @@ async def _persist_interaction_if_configured(
             "audioUrl": None,
             "ts": int(ts_ms),
         }
-        await _convex_mutation("functions/interactions:appendInteraction", args)
+        # Only include groupId when provided (Convex validator expects optional/undefined, not null)
+        if group_id:
+            args["groupId"] = group_id
+        t0 = time.perf_counter()
+        try:
+            await _convex_mutation("functions/interactions:appendInteraction", args)
+            try:
+                TRANSCRIPT_PERSIST_TOTAL.labels(outcome="success", role=str(role or "unknown")).inc()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                TRANSCRIPT_PERSIST_TOTAL.labels(outcome="error", role=str(role or "unknown")).inc()
+            except Exception:
+                pass
+        finally:
+            try:
+                TRANSCRIPT_PERSIST_SECONDS.observe(time.perf_counter() - t0)
+            except Exception:
+                pass
     except Exception:
         # Best-effort; never fail caller
         pass
@@ -1788,10 +1997,10 @@ async def messages_ingest(request: Request):
         app.state.session_state[session_id] = session_state  # type: ignore[attr-defined]
 
     # Append to in-memory transcript buffer for this session (foundation for rubric v1)
+    ts_ms: int
     try:
         transcripts: Dict[str, List[Dict[str, Any]]] = app.state.session_transcripts  # type: ignore[attr-defined]
         lst = transcripts.setdefault(session_id, [])
-        ts_ms: int
         try:
             ts_ms = int(ts) if ts is not None else int(time.time() * 1000)
         except Exception:
@@ -1806,6 +2015,10 @@ async def messages_ingest(request: Request):
     except Exception:
         # Do not fail ingestion if transcript buffering has issues
         evt_idx = -1  # sentinel
+        try:
+            ts_ms = int(ts) if ts is not None else int(time.time() * 1000)
+        except Exception:
+            ts_ms = int(time.time() * 1000)
 
     # Classifier provider integration (env-gated) with robust fallback
     turn_count = int(session_state.get("turnCount", 0))
@@ -1825,14 +2038,67 @@ async def messages_ingest(request: Request):
             client = get_classifier_client(model=_cls_model)
             cls_provider = getattr(client, "provider_name", None) or "unknown"
             cls_model = getattr(client, "model", None)
-            cls = await client.classify(role, content or "", turn_count, request_id=request_id)
+            # Build compact context and embed into the content for provider-agnostic interfaces
+            try:
+                ctx = await _build_classifier_context_summary(session_id)
+            except Exception:
+                ctx = ""
+            infused = (f"ctx: {ctx}\nmsg: {content or ''}" if ctx else (content or ""))
+            # Debug: log exact classifier request payload
+            try:
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": "classifier_request",
+                            "requestId": request_id,
+                            "trackedSkillIdHash": tracked_hash,
+                            "sessionId": session_id,
+                            "messageId": message_id,
+                            "provider": cls_provider,
+                            "model": cls_model,
+                            "role": role,
+                            "turnCount": turn_count,
+                            "ctx_len": len(ctx or ""),
+                            "infused": infused,
+                        }
+                    )
+                )
+            except Exception:
+                pass
+            cls = await client.classify(role, infused, turn_count, request_id=request_id)
         except Exception:
             # Fallback to deterministic mock classifier
             try:
                 client = get_classifier_client(provider="mock", model=os.getenv("AI_CLASSIFIER_MODEL", "").strip() or None)
                 cls_provider = getattr(client, "provider_name", None) or "mock"
                 cls_model = getattr(client, "model", None)
-                cls = await client.classify(role, content or "", turn_count, request_id=request_id)
+                try:
+                    ctx = await _build_classifier_context_summary(session_id)
+                except Exception:
+                    ctx = ""
+                infused = (f"ctx: {ctx}\nmsg: {content or ''}" if ctx else (content or ""))
+                # Debug: log exact classifier request payload (fallback)
+                try:
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "classifier_request",
+                                "requestId": request_id,
+                                "trackedSkillIdHash": tracked_hash,
+                                "sessionId": session_id,
+                                "messageId": message_id,
+                                "provider": cls_provider,
+                                "model": cls_model,
+                                "role": role,
+                                "turnCount": turn_count,
+                                "ctx_len": len(ctx or ""),
+                                "infused": infused,
+                            }
+                        )
+                    )
+                except Exception:
+                    pass
+                cls = await client.classify(role, infused, turn_count, request_id=request_id)
             except Exception:
                 # Last resort: local stub
                 _cls_res = _classify_message_llm_stub(role, content or "", turn_count)
@@ -2061,6 +2327,23 @@ async def messages_ingest(request: Request):
         "turnCount": session_state.get("turnCount", 0),
         "enqueued": enqueued,
     }
+    # Best-effort persistence to Convex (respects privacy opt-out)
+    try:
+        gid_for_persist: Optional[str] = None
+        if decision == "one_off":
+            gid_for_persist = session_state.get("groupId")
+        else:
+            gid_for_persist = session_state.get("groupId")
+        await _persist_interaction_if_configured(
+            session_id=session_id,
+            group_id=gid_for_persist,
+            message_id=message_id,
+            role=role,
+            content=content,
+            ts_ms=ts_ms,
+        )
+    except Exception:
+        pass
     try:
         logger.info(
             json.dumps(
