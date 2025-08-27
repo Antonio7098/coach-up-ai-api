@@ -404,6 +404,9 @@ async def chat_stream(
     # Provider selection (env-gated)
     _enabled = os.getenv("AI_CHAT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     _model = os.getenv("AI_CHAT_MODEL", "").strip() or None
+    
+    # Debug: log provider configuration
+    logger.info(f"[DEBUG] AI_CHAT_ENABLED={_enabled}, AI_CHAT_MODEL={_model}")
 
     async def instrumented_stream():
         nonlocal first_token_s
@@ -463,6 +466,10 @@ async def chat_stream(
                             ctx = ""
                             ctx_source = "none"
                     infused = (f"ctx: {ctx}\nmsg: {prompt or ''}" if ctx else (prompt or ""))
+                    
+                    # Build system prompt with speech coaching context and tracked skills
+                    system_prompt = await _build_system_prompt(sid)
+                    
                     # Debug: log exact prompt payload being sent to chat LLM (with context details)
                     try:
                         logger.info(
@@ -481,12 +488,20 @@ async def chat_stream(
                                     "history_present": bool(hist_b64),
                                     "ctx_len": len(ctx or ""),
                                     "infused_len": len(infused),
+                                    "system_prompt_len": len(system_prompt),
                                 }
                             )
                         )
+                        # Debug: log full system prompt and user message content
+                        print(f"[DEBUG] AI_CHAT_ENABLED={_enabled}, AI_CHAT_MODEL={model_name}")
+                        print(f"[DEBUG] System prompt: {system_prompt}")
+                        print(f"[DEBUG] User message (infused): {infused}")
+                        logger.info(f"[DEBUG] AI_CHAT_ENABLED={_enabled}, AI_CHAT_MODEL={model_name}")
+                        logger.info(f"[DEBUG] System prompt: {system_prompt}")
+                        logger.info(f"[DEBUG] User message (infused): {infused}")
                     except Exception:
                         pass
-                    async for token in client.stream_chat(infused, request_id=request_id):
+                    async for token in client.stream_chat(infused, system=system_prompt, request_id=request_id):
                         chunk = f"data: {token}\n\n"
                         if first_token_s is None:
                             first_token_s = time.perf_counter() - start
@@ -541,6 +556,76 @@ async def chat_stream(
                     # Fallback to stub stream on any provider error
                     provider_name = provider_name or "fallback_stub"
                     model_name = model_name or None
+            else:
+                # Stub mode: return a simple response
+                provider_name = "stub"
+                model_name = None
+                
+                # Build context and system prompt even in stub mode for debugging
+                sid = session_id or request.query_params.get("session_id") or request.query_params.get("sessionId")
+                ctx = ""
+                ctx_source = "none"
+                hist_b64 = request.query_params.get("history")
+                # Try client-provided history (base64url JSON array of {role, content})
+                if hist_b64:
+                    try:
+                        s = str(hist_b64)
+                        pad = "=" * (-len(s) % 4)
+                        decoded = base64.urlsafe_b64decode((s + pad).encode("utf-8")).decode("utf-8", errors="ignore")
+                        arr = json.loads(decoded)
+                        if isinstance(arr, list) and arr:
+                            # Limit number of messages for safety
+                            try:
+                                limit = _chat_context_limit_default()
+                            except Exception:
+                                limit = 10
+                            items = arr[-max(1, min(200, limit)):]
+                            lines: List[str] = []
+                            for it in items:
+                                if not isinstance(it, dict):
+                                    continue
+                                role = str((it.get("role") or "")).lower()
+                                tag = "u" if role == "user" else ("a" if role == "assistant" else "?")
+                                txt = str((it.get("content") or "")).replace("\n", " ").strip()
+                                if len(txt) > 240:
+                                    txt = txt[:237] + "..."
+                                if txt:
+                                    lines.append(f"{tag}: {txt}")
+                            ctx = "; ".join(lines)
+                            if len(ctx) > 2000:
+                                ctx = ctx[:1997] + "..."
+                            if ctx:
+                                ctx_source = "client"
+                    except Exception:
+                        pass
+                # Fallback to server-side transcript summary when client history not present/invalid
+                if not ctx and sid:
+                    try:
+                        ctx = await _build_classifier_context_summary(sid)
+                        if ctx:
+                            ctx_source = "server"
+                    except Exception:
+                        ctx = ""
+                        ctx_source = "none"
+                infused = (f"ctx: {ctx}\nmsg: {prompt or ''}" if ctx else (prompt or ""))
+                
+                # Build system prompt with speech coaching context and tracked skills
+                system_prompt = await _build_system_prompt(sid)
+                
+                # Debug: log full system prompt and user message content (even in stub mode)
+                try:
+                    logger.info(f"[DEBUG] System prompt: {system_prompt}")
+                    logger.info(f"[DEBUG] User message (infused): {infused}")
+                except Exception:
+                    pass
+                
+                async def _token_stream():
+                    yield "Hello! I'm in stub mode. "
+                    await asyncio.sleep(0.05)
+                    yield "Chat functionality is disabled. "
+                    await asyncio.sleep(0.05)
+                    yield "Set AI_CHAT_ENABLED=1 to enable real chat."
+                    await asyncio.sleep(0.15)
             async for chunk in _token_stream():
                 if first_token_s is None:
                     first_token_s = time.perf_counter() - start
@@ -672,6 +757,58 @@ def _compute_rubric_v1_summary_from_spans(
         },
     }
 
+async def _build_system_prompt(session_id: Optional[str]) -> str:
+    """Build system prompt with speech coaching context and user's tracked skills."""
+    base_prompt = (
+        "You are an expert speech coach and communication trainer. Your role is to help users improve their "
+        "speaking skills through personalized guidance, feedback, and practice exercises. You provide supportive, "
+        "constructive feedback while maintaining an encouraging and professional tone.\n\n"
+        "Key responsibilities:\n"
+        "- Analyze speech patterns, delivery, and communication effectiveness\n"
+        "- Provide specific, actionable feedback for improvement\n"
+        "- Suggest practice exercises and techniques\n"
+        "- Help with presentation skills, public speaking, and everyday communication\n"
+        "- Maintain a supportive and encouraging coaching style\n\n"
+    )
+    
+    # Add tracked skills context if available
+    if session_id:
+        try:
+            skills = await _get_tracked_skills_for_session(session_id)
+            if skills:
+                skill_names = [skill.get("name", "") for skill in skills if skill.get("name")]
+                if skill_names:
+                    try:
+                        print(f"[DEBUG] Tracked skills resolved for session {session_id}: {skill_names}")
+                        logger.info(
+                            json.dumps(
+                                {
+                                    "event": "tracked_skills_resolved",
+                                    "route": "/chat/stream",
+                                    "session_id_present": bool(session_id),
+                                    "skill_count": len(skill_names),
+                                    "skill_names": skill_names,
+                                }
+                            )
+                        )
+                    except Exception:
+                        pass
+                    skills_text = ", ".join(skill_names)
+                    base_prompt += (
+                        f"Current focus areas for this user: {skills_text}\n"
+                        "Pay special attention to these skills when providing feedback and suggestions.\n\n"
+                    )
+        except Exception:
+            # Fallback gracefully if skills lookup fails
+            pass
+    
+    base_prompt += (
+        "Respond naturally and conversationally. Keep responses concise but helpful. "
+        "Focus on practical advice the user can immediately apply."
+    )
+    
+    return base_prompt
+
 async def _get_tracked_skills_for_session(session_id: str) -> List[Dict[str, Any]]:
     """Fetch tracked skills for a session.
 
@@ -686,7 +823,37 @@ async def _get_tracked_skills_for_session(session_id: str) -> List[Dict[str, Any
         try:
             raw = (os.getenv("ASSESS_TRACKED_SKILLS_JSON", "") or "").strip()
             if not raw:
-                return []
+                # If MOCK_CONVEX is enabled, seed a default set of skills
+                mock_on = (os.getenv("MOCK_CONVEX", "0").strip().lower() in ("1", "true", "yes", "on"))
+                if mock_on:
+                    seeded = [
+                        {"id": "clarity", "name": "Clarity", "category": "delivery"},
+                        {"id": "pacing", "name": "Pacing", "category": "delivery"},
+                        {"id": "concision", "name": "Concision", "category": "content"},
+                        {"id": "energy", "name": "Energy", "category": "delivery"},
+                        {"id": "filler_words", "name": "Filler Words", "category": "delivery"},
+                    ]
+                    try:
+                        print("[DEBUG] MOCK_CONVEX enabled; seeding tracked skills fallback")
+                        logger.info(
+                            json.dumps(
+                                {
+                                    "event": "tracked_skills_mock_seeded",
+                                    "count": len(seeded),
+                                    "names": [s["name"] for s in seeded],
+                                }
+                            )
+                        )
+                    except Exception:
+                        pass
+                    return seeded
+                else:
+                    try:
+                        print("[DEBUG] No ASSESS_TRACKED_SKILLS_JSON present; returning empty tracked skills fallback")
+                        logger.info("[DEBUG] No ASSESS_TRACKED_SKILLS_JSON present; returning empty tracked skills fallback")
+                    except Exception:
+                        pass
+                    return []
             val = json.loads(raw)
             if isinstance(val, list):
                 out2: List[Dict[str, Any]] = []
@@ -699,6 +866,20 @@ async def _get_tracked_skills_for_session(session_id: str) -> List[Dict[str, Any
                                 "category": it.get("category"),
                             }
                         )
+                try:
+                    names = [d.get("name") for d in out2 if d.get("name")]
+                    print(f"[DEBUG] Using tracked skills from ASSESS_TRACKED_SKILLS_JSON: {names}")
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "tracked_skills_fallback_env",
+                                "count": len(names),
+                                "names": names,
+                            }
+                        )
+                    )
+                except Exception:
+                    pass
                 return out2
         except Exception:
             pass
@@ -707,6 +888,11 @@ async def _get_tracked_skills_for_session(session_id: str) -> List[Dict[str, Any
     try:
         base_url = (os.getenv("CONVEX_URL") or "").strip()
         if not base_url:
+            try:
+                print("[DEBUG] CONVEX_URL not set; falling back to ASSESS_TRACKED_SKILLS_JSON")
+                logger.info("[DEBUG] CONVEX_URL not set; falling back to ASSESS_TRACKED_SKILLS_JSON")
+            except Exception:
+                pass
             return _fallback_from_env()
 
         url = base_url.rstrip("/") + "/api/query"
@@ -726,10 +912,20 @@ async def _get_tracked_skills_for_session(session_id: str) -> List[Dict[str, Any
             resp1 = await client.post(url, json=payload1, headers={"Content-Type": "application/json"})
             data1 = resp1.json() if resp1.headers.get("content-type", "").startswith("application/json") else {}
             if resp1.status_code >= 400 or (isinstance(data1, dict) and data1.get("status") == "error"):
+                try:
+                    print(f"[DEBUG] Convex sessions:getBySessionId error status={resp1.status_code}; falling back to env")
+                    logger.info("[DEBUG] Convex sessions:getBySessionId error; falling back to env")
+                except Exception:
+                    pass
                 return _fallback_from_env()
             session_doc = data1.get("value") if isinstance(data1, dict) else None
             user_id = (session_doc or {}).get("userId") if isinstance(session_doc, dict) else None
             if not user_id or not str(user_id).strip():
+                try:
+                    print("[DEBUG] No userId resolved from session; falling back to env")
+                    logger.info("[DEBUG] No userId resolved from session; falling back to env")
+                except Exception:
+                    pass
                 return _fallback_from_env()
 
             # 2) Fetch tracked skills for user
@@ -741,6 +937,11 @@ async def _get_tracked_skills_for_session(session_id: str) -> List[Dict[str, Any
             resp2 = await client.post(url, json=payload2, headers={"Content-Type": "application/json"})
             data2 = resp2.json() if resp2.headers.get("content-type", "").startswith("application/json") else {}
             if resp2.status_code >= 400 or (isinstance(data2, dict) and data2.get("status") == "error"):
+                try:
+                    print(f"[DEBUG] Convex skills:getTrackedSkillsForUser error status={resp2.status_code}; falling back to env")
+                    logger.info("[DEBUG] Convex skills:getTrackedSkillsForUser error; falling back to env")
+                except Exception:
+                    pass
                 return _fallback_from_env()
             rows = data2.get("value") if isinstance(data2, dict) else None
 
