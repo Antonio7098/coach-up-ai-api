@@ -107,6 +107,23 @@ HTTP_REQUEST_DURATION_SECONDS = Histogram(
 )
 
 logger = logging.getLogger("coach_up.ai.chat")
+# Ensure our application logger emits under Uvicorn:
+# - honor LOG_LEVEL env (default INFO)
+# - attach a StreamHandler if none present
+# - disable propagate to avoid duplicate logs with Uvicorn root handlers
+try:
+    _lvl_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    _lvl = getattr(logging, _lvl_name, logging.INFO)
+except Exception:
+    _lvl = logging.INFO
+logger.setLevel(_lvl)
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setLevel(_lvl)
+    _h.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(_h)
+# Avoid double logging if root/uvicorn also handle propagation
+logger.propagate = False
 
 # Prometheus metrics
 SQS_SEND_SECONDS = Histogram("coachup_sqs_send_seconds", "Duration of SQS send_message in seconds")
@@ -427,7 +444,23 @@ async def chat_stream(
             client_outer = get_chat_client(model=_model)
             provider_name = getattr(client_outer, "provider_name", None) or provider_name
             model_name = getattr(client_outer, "model", None) or model_name
-        except Exception:
+        except Exception as e:
+            # Log client construction error for better diagnostics instead of silently swallowing
+            try:
+                logger.exception(
+                    json.dumps(
+                        {
+                            "event": "chat_stream_client_build_error",
+                            "route": "/chat/stream",
+                            "requestId": getattr(getattr(request, "state", object()), "request_id", None) or request.headers.get("x-request-id"),
+                            "provider": provider_name or (os.getenv("AI_PROVIDER_CHAT") or os.getenv("AI_PROVIDER") or "unknown"),
+                            "model": _model,
+                            "error": str(e),
+                        }
+                    )
+                )
+            except Exception:
+                pass
             client_outer = None
 
     async def instrumented_stream():
@@ -2330,6 +2363,13 @@ ASSESSMENTS_BACKOFF_BASE_MS = _env_int("ASSESSMENTS_BACKOFF_BASE_MS", 200)
 ASSESS_PER_SKILL_TIMEOUT_MS = _env_int("ASSESS_PER_SKILL_TIMEOUT_MS", 8000)
 ASSESS_GROUP_TIMEOUT_MS = _env_int("ASSESS_GROUP_TIMEOUT_MS", 15000)
 
+# Interaction/session safety guards
+# - Max turns per multi-turn interaction before we force an 'end'
+# - Idle timeout (reserved for future use; enforced by higher layers or future PR)
+INTERACTION_MAX_TURNS = _env_int("INTERACTION_MAX_TURNS", 12)
+INTERACTION_IDLE_TIMEOUT_MS = _env_int("INTERACTION_IDLE_TIMEOUT_MS", 300000)
+INTERACTION_GUARDS_ENABLED = _env_bool("INTERACTION_GUARDS_ENABLED", False)
+
 # Hashing salt for skill IDs
 SKILL_HASH_SALT = os.getenv("SKILL_HASH_SALT", "").strip()
 
@@ -2647,9 +2687,71 @@ async def messages_ingest(request: Request):
     low = CLASSIFIER_CONF_LOW <= confidence < CLASSIFIER_CONF_ACCEPT
 
     if not accepted:
-        # Apply heuristic fallback or override if low or abstain
+        # Apply heuristic fallback or override if low confidence or abstain decision
         heuristic = _heuristic_decision(role, content or "", bool(session_state.get("active")))
-        decision = heuristic if confidence < CLASSIFIER_CONF_LOW else decision
+        # Use heuristic if confidence is low OR if decision is abstain/ignore (regardless of confidence)
+        if confidence < CLASSIFIER_CONF_LOW or decision in ["abstain", "ignore"]:
+            decision = heuristic
+
+    # Conservative backend guards to prevent runaway multi-turns (opt-in)
+    decision_pre_guards = decision
+    idle_ms = 0
+    if INTERACTION_GUARDS_ENABLED:
+        # 1) Require accepted confidence to start a session. Otherwise abstain.
+        if decision == "start" and not accepted:
+            decision = "abstain"
+
+        # Compute idle gap since last message in this session (ms)
+        try:
+            last_ts_val = int(session_state.get("lastTs") or ts_ms)
+        except Exception:
+            last_ts_val = ts_ms
+        idle_ms = max(0, int(ts_ms) - int(last_ts_val))
+
+        # 2) If classifier says continue but session is not active, promote to start
+        # so the first message can open a session rather than being dropped.
+        if decision == "continue" and not session_state.get("active"):
+            decision = "start"
+
+        # 3) If continue while idle beyond threshold, force an end to close the prior interaction
+        if decision == "continue" and session_state.get("active") and idle_ms > INTERACTION_IDLE_TIMEOUT_MS:
+            decision = "end"
+
+        # 4) Enforce max turns: if continuing would exceed cap, end the interaction on this message
+        if decision == "continue":
+            projected_turns = int(session_state.get("turnCount", 0)) + 1
+            if projected_turns >= INTERACTION_MAX_TURNS:
+                decision = "end"
+
+    # Telemetry polish: if a session is already active, normalize a 'start' to 'continue'
+    # so analytics don't double-count starts. This does not change state behavior.
+    if session_state.get("active") and decision == "start":
+        decision = "continue"
+
+    # Emit a single structured log capturing classifier outcome and any guard overrides
+    try:
+        logger.info(json.dumps({
+            "event": "classifier_decision",
+            "requestId": request_id,
+            "trackedSkillIdHash": tracked_hash,
+            "sessionId": session_id,
+            "messageId": message_id,
+            "provider": cls_provider,
+            "model": cls_model,
+            "role": role,
+            "turnCount": turn_count,
+            "activeBefore": bool(session_state.get("active")),
+            "confidence": confidence,
+            "accepted": accepted,
+            "low": low,
+            "decisionPre": decision_pre_guards,
+            "decisionPost": decision,
+            "guardsEnabled": INTERACTION_GUARDS_ENABLED,
+            "idleMs": idle_ms,
+            "maxTurns": INTERACTION_MAX_TURNS,
+        }))
+    except Exception:
+        pass
 
     # Apply state machine
     enqueued = False

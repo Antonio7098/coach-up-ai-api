@@ -29,7 +29,7 @@ class ClassifierClient(abc.ABC):
         self.model = model
 
     @abc.abstractmethod
-    async def classify(self, role: str, content: str, turn_count: int, request_id: Optional[str] = None) -> dict:
+    async def classify(self, role: str, content: str, turn_count: int, request_id: Optional[str] = None, context: Optional[list] = None) -> dict:
         ...
 
 
