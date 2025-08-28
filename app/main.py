@@ -511,7 +511,34 @@ async def chat_stream(
                     except Exception:
                         _timeout_s = 2.0
                     try:
-                        system_prompt = await asyncio.wait_for(_build_system_prompt(sid), timeout=_timeout_s)
+                        # Prefer client-provided tracked skills when available (base64url JSON array)
+                        client_skills: Optional[List[Dict[str, Any]]] = None
+                        try:
+                            skills_b64 = request.query_params.get("skills")
+                            if skills_b64:
+                                s = str(skills_b64)
+                                pad = "=" * (-len(s) % 4)
+                                decoded = base64.urlsafe_b64decode((s + pad).encode("utf-8")).decode("utf-8", errors="ignore")
+                                arr = json.loads(decoded)
+                                if isinstance(arr, list) and arr:
+                                    norm: List[Dict[str, Any]] = []
+                                    for it in arr:
+                                        if isinstance(it, dict):
+                                            obj = {
+                                                "id": it.get("id"),
+                                                "name": it.get("name") or it.get("title"),
+                                                "category": it.get("category"),
+                                            }
+                                            # Drop empties
+                                            obj = {k: v for k, v in obj.items() if v}
+                                            norm.append(obj)
+                                        elif isinstance(it, str):
+                                            norm.append({"name": it})
+                                    if norm:
+                                        client_skills = norm
+                        except Exception:
+                            client_skills = None
+                        system_prompt = await asyncio.wait_for(_build_system_prompt(sid, client_skills=client_skills), timeout=_timeout_s)
                     except Exception:
                         system_prompt = ""
                     
@@ -1026,57 +1053,94 @@ def _compute_rubric_v1_summary_from_spans(
         },
     }
 
-async def _build_system_prompt(session_id: Optional[str]) -> str:
+async def _build_system_prompt(session_id: Optional[str], *, client_skills: Optional[List[Dict[str, Any]]] = None) -> str:
     """Build system prompt with speech coaching context and user's tracked skills."""
     base_prompt = (
-        "You are an expert speech coach and communication trainer. Your role is to help users improve their "
-        "speaking skills through personalized guidance, feedback, and practice exercises. You provide supportive, "
-        "constructive feedback while maintaining an encouraging and professional tone.\n\n"
-        "Key responsibilities:\n"
-        "- Analyze speech patterns, delivery, and communication effectiveness\n"
-        "- Provide specific, actionable feedback for improvement\n"
-        "- Suggest practice exercises and techniques\n"
-        "- Help with presentation skills, public speaking, and everyday communication\n"
-        "- Maintain a supportive and encouraging coaching style\n\n"
+        "You are a concise, friendly speech coach. Your purpose is to help users improve speaking skills through short, actionable guidance and practice.\n\n"
+        "Behavioral rules:\n"
+        "- Greetings and small talk: reply with 1 short friendly sentence, then immediately pivot to the goal.\n"
+        "- Do not analyze pleasantries or single-line greetings.\n"
+        "- Default response length: at most 2–3 sentences or 5 short bullets.\n"
+        "- Ask exactly one question to clarify goals or select the next focus area.\n"
+        "- Only analyze speech when the user asks for analysis/feedback or after they choose a focus area.\n"
+        "- If the user hasn’t specified a focus, offer 3–5 options (e.g., clarity, pacing, energy, filler words, structure).\n"
+        "- When providing guidance, prefer practical, immediately applicable tips.\n"
+        "- Avoid repeating the user’s message. Avoid long explanations. Be supportive and encouraging.\n\n"
+        "If a focus area is chosen:\n"
+        "- Provide 2–3 concise, actionable tips (or 1 micro-exercise), then ask one next-step question.\n\n"
+        "If user asks for analysis:\n"
+        "- Keep analysis brief (2–3 bullets), then 1–2 concrete next actions.\n\n"
+        "Stay conversational, positive, and time-efficient."
     )
     
     # Add tracked skills context if available
-    if session_id:
+    skills: List[Dict[str, Any]] = []
+    # Prefer client-provided skills to avoid extra round-trips
+    if client_skills and isinstance(client_skills, list):
+        skills = client_skills
+    elif session_id:
         try:
             skills = await _get_tracked_skills_for_session(session_id)
-            if skills:
-                skill_names = [skill.get("name", "") for skill in skills if skill.get("name")]
-                if skill_names:
-                    try:
-                        print(f"[DEBUG] Tracked skills resolved for session {session_id}: {skill_names}")
-                        logger.info(
-                            json.dumps(
-                                {
-                                    "event": "tracked_skills_resolved",
-                                    "route": "/chat/stream",
-                                    "session_id_present": bool(session_id),
-                                    "skill_count": len(skill_names),
-                                    "skill_names": skill_names,
-                                }
-                            )
-                        )
-                    except Exception:
-                        pass
-                    skills_text = ", ".join(skill_names)
-                    base_prompt += (
-                        f"Current focus areas for this user: {skills_text}\n"
-                        "Pay special attention to these skills when providing feedback and suggestions.\n\n"
-                    )
         except Exception:
-            # Fallback gracefully if skills lookup fails
-            pass
-    
+            skills = []
+    if skills:
+        skill_names = [str(s.get("name") or s.get("title") or s.get("id") or "").strip() for s in skills]
+        skill_names = [n for n in skill_names if n]
+        if skill_names:
+            try:
+                print(f"[DEBUG] Tracked skills resolved for session {session_id}: {skill_names}")
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": "tracked_skills_resolved",
+                            "route": "/chat/stream",
+                            "session_id_present": bool(session_id),
+                            "skill_count": len(skill_names),
+                            "skill_names": skill_names,
+                            "source": "client" if client_skills else "server",
+                        }
+                    )
+                )
+            except Exception:
+                pass
+            skills_text = ", ".join(skill_names)
+            base_prompt += (
+                f"Current focus areas for this user: {skills_text}\n"
+                "These reflect the user's selected goals. Prioritize these areas when providing tips, but keep responses brief.\n\n"
+            )
     base_prompt += (
         "Respond naturally and conversationally. Keep responses concise but helpful. "
         "Focus on practical advice the user can immediately apply."
     )
-    
+
     return base_prompt
+
+@app.get("/chat/tracked-skills", tags=["chat"], description="Fetch tracked skills for a session (for client caching).")
+async def chat_tracked_skills(session_id: Optional[str] = Query(None, description="Session ID")):
+    try:
+        if not session_id:
+            return JSONResponse({"skills": []}, status_code=200)
+        skills = await _get_tracked_skills_for_session(session_id)
+        # Normalize to minimal shape
+        out: List[Dict[str, Any]] = []
+        for s in skills or []:
+            if not isinstance(s, dict):
+                continue
+            obj = {
+                "id": s.get("id"),
+                "name": s.get("name") or s.get("title"),
+                "category": s.get("category"),
+            }
+            obj = {k: v for k, v in obj.items() if v}
+            if obj.get("name"):
+                out.append(obj)
+        return JSONResponse({"skills": out}, status_code=200)
+    except Exception as e:
+        try:
+            logger.exception("/chat/tracked-skills error: %s", e)
+        except Exception:
+            pass
+        return JSONResponse({"skills": []}, status_code=200)
 
 async def _get_tracked_skills_for_session(session_id: str) -> List[Dict[str, Any]]:
     """Fetch tracked skills for a session.

@@ -50,6 +50,14 @@ class OpenRouterChatClient(ChatClient):
             "messages": messages,
             "stream": True,
         }
+        # Optional cap on response length for concise coaching replies
+        try:
+            max_tokens_env = os.getenv("AI_CHAT_MAX_TOKENS", "120").strip()
+            max_tokens = int(max_tokens_env) if max_tokens_env else 120
+            if max_tokens > 0:
+                payload["max_tokens"] = max_tokens
+        except Exception:
+            pass
 
         # Use a short-lived AsyncClient per request to ensure proper cleanup
         async with httpx.AsyncClient(timeout=self._timeout) as client:
