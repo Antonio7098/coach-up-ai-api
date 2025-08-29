@@ -19,6 +19,7 @@ import hashlib
 import base64
 from contextlib import asynccontextmanager
 import io
+import re
 import wave
 import httpx
 
@@ -184,6 +185,25 @@ CHAT_TOTAL_SECONDS = Histogram(
     ["provider", "model"],
 )
 
+# Session summary metrics (independent of assessments)
+SUMMARY_JOBS_TOTAL = Counter(
+    "coachup_summary_jobs_total",
+    "Session summary job outcomes",
+    ["status"],
+)
+SUMMARY_JOB_SECONDS = Histogram(
+    "coachup_summary_job_seconds",
+    "Duration of session summary jobs in seconds",
+)
+SUMMARY_ENQUEUE_LAT_SECONDS = Histogram(
+    "coachup_summary_enqueue_latency_seconds",
+    "Latency from enqueue to dequeue for session summary in seconds",
+)
+SUMMARY_QUEUE_DEPTH = Gauge(
+    "coachup_summary_queue_depth",
+    "Session summary queue depth (in-memory)",
+)
+
 # Transcript persistence & classifier context metrics
 TRANSCRIPT_PERSIST_TOTAL = Counter(
     "coachup_transcript_persist_total",
@@ -231,6 +251,10 @@ async def lifespan(app: FastAPI):
     app.state.group_spans = {}  # type: ignore[attr-defined]
     # In-memory TTS audio store for benchmarking stub
     app.state.tts_audio = {}  # type: ignore[attr-defined]
+    # Session summary: queue and latest summaries per session
+    app.state.summary_queue = asyncio.Queue()  # type: ignore[attr-defined]
+    app.state.session_summaries = {}  # type: ignore[attr-defined]
+    app.state.summary_enqueued_ts = {}  # type: ignore[attr-defined]
     # Initialize queue depth gauge for in-memory provider
     try:
         QUE_DEPTH.labels(provider="memory").set(app.state.assessment_queue.qsize())  # type: ignore[attr-defined]
@@ -248,6 +272,12 @@ async def lifespan(app: FastAPI):
     # Back-compat single task attribute
     if workers:
         app.state.assessment_worker_task = workers[0]  # type: ignore[attr-defined]
+    # Spawn session summary workers (independent of assessments)
+    summary_workers: List[asyncio.Task] = []
+    if SUMMARY_ENABLED:
+        for i in range(max(1, SUMMARY_WORKER_CONCURRENCY)):
+            summary_workers.append(asyncio.create_task(_summary_worker(app, i)))
+    app.state.summary_worker_tasks = summary_workers  # type: ignore[attr-defined]
     # In-memory session interaction state and processed ids
     app.state.session_state: Dict[str, Dict[str, Any]] = {}
     # Track processed message ids per-session to avoid cross-session dedupe collisions
@@ -283,6 +313,18 @@ async def lifespan(app: FastAPI):
                     await task
                 except Exception:
                     pass
+        # Shutdown summary workers
+        try:
+            s_tasks: Optional[List[asyncio.Task]] = getattr(app.state, "summary_worker_tasks", None)
+            if s_tasks:
+                for t in s_tasks:
+                    t.cancel()
+                try:
+                    await asyncio.gather(*s_tasks, return_exceptions=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 # Register lifespan context to replace deprecated on_event hooks
 app.router.lifespan_context = lifespan
@@ -1113,6 +1155,23 @@ def _compute_rubric_v1_summary_from_spans(
         },
     }
 
+@app.get(
+    "/api/v1/session-summary",
+    tags=["chat"],
+    description="Return latest rolling summary for a session (independent of assessments).",
+)
+async def get_session_summary(sessionId: Optional[str] = Query(None, description="Session ID")):
+    if not sessionId:
+        return JSONResponse({"version": 0, "updatedAt": 0, "summaryText": ""}, status_code=200)
+    try:
+        store: Dict[str, Dict[str, Any]] = app.state.session_summaries  # type: ignore[attr-defined]
+    except Exception:
+        store = {}
+    row = store.get(sessionId) or {"version": 0, "updatedAt": 0, "summaryText": ""}
+    etag = f"{sessionId}:{row.get('version', 0)}"
+    headers = {"ETag": etag}
+    return JSONResponse(row, headers=headers, status_code=200)
+
 async def _build_system_prompt(session_id: Optional[str], *, client_skills: Optional[List[Dict[str, Any]]] = None) -> str:
     """Build system prompt with speech coaching context and user's tracked skills."""
     base_prompt = (
@@ -1222,9 +1281,6 @@ async def _get_tracked_skills_for_session(session_id: str) -> List[Dict[str, Any
                     seeded = [
                         {"id": "clarity", "name": "Clarity", "category": "delivery"},
                         {"id": "pacing", "name": "Pacing", "category": "delivery"},
-                        {"id": "concision", "name": "Concision", "category": "content"},
-                        {"id": "energy", "name": "Energy", "category": "delivery"},
-                        {"id": "filler_words", "name": "Filler Words", "category": "delivery"},
                     ]
                     try:
                         print("[DEBUG] MOCK_CONVEX enabled; seeding tracked skills fallback")
@@ -2430,6 +2486,13 @@ AWS_ENDPOINT_URL_SQS = os.getenv("AWS_ENDPOINT_URL_SQS", "").strip()
 PERSIST_ASSESSMENTS_URL = os.getenv("PERSIST_ASSESSMENTS_URL", "").strip()
 PERSIST_ASSESSMENTS_SECRET = os.getenv("PERSIST_ASSESSMENTS_SECRET", "").strip()
 
+# Session summary env configuration
+SUMMARY_ENABLED = _env_bool("SUMMARY_ENABLED", True)
+SUMMARY_WORKER_CONCURRENCY = _env_int("SUMMARY_WORKER_CONCURRENCY", 1)
+SUMMARY_WINDOW_N = _env_int("SUMMARY_WINDOW_N", 10)
+SUMMARY_PERSIST_URL = os.getenv("SUMMARY_PERSIST_URL", "").strip()
+SUMMARY_PERSIST_AUTH = os.getenv("SUMMARY_PERSIST_AUTH", "").strip()
+
 def _as_str_list(val: Any) -> List[str]:
     out: List[str] = []
     if isinstance(val, list):
@@ -2557,6 +2620,119 @@ def _ensure_group(session_state: Dict[str, Any]) -> None:
         session_state["active"] = True
 
 
+# -----------------------------
+# Session Summary: helper and worker
+# -----------------------------
+
+def _build_rolling_summary_text(messages: List[Dict[str, Any]], *, max_chars: int = 2000) -> str:
+    # Deterministic compact digest of last N messages: "role: content" lines, whitespace collapsed
+    parts: List[str] = []
+    for m in messages:
+        role = (m.get("role") or "").strip()[:12]
+        content = re.sub(r"\s+", " ", (m.get("content") or "").strip())
+        if len(content) > 220:
+            content = content[:217] + "…"
+        parts.append(f"{role}: {content}")
+    out = "\n".join(parts)
+    if len(out) > max_chars:
+        out = out[-max_chars:]
+    return out
+
+
+async def _persist_summary_if_configured(payload: Dict[str, Any], *, request_id: Optional[str] = None) -> None:
+    if not SUMMARY_PERSIST_URL:
+        return
+    headers = {"content-type": "application/json"}
+    if SUMMARY_PERSIST_AUTH:
+        headers["authorization"] = SUMMARY_PERSIST_AUTH
+    if request_id:
+        headers["x-request-id"] = str(request_id)
+
+    def _do_request():
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(SUMMARY_PERSIST_URL, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                try:
+                    resp.read()
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                logger.warning(json.dumps({
+                    "event": "summary_persist_error",
+                    "sessionId": payload.get("sessionId"),
+                    "error": str(e),
+                }))
+            except Exception:
+                pass
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _do_request)
+
+
+async def _summary_worker(app: FastAPI, worker_index: int = 0):
+    """Background worker for session summary jobs.
+
+    Job item: (session_id: str, version: int, enq_ts: float)
+    """
+    queue: asyncio.Queue[Tuple[str, int, float]] = app.state.summary_queue
+    while True:
+        try:
+            session_id, version, enq_ts = await queue.get()
+            try:
+                SUMMARY_QUEUE_DEPTH.set(queue.qsize())
+            except Exception:
+                pass
+            t0 = time.perf_counter()
+            # Build summary from last N messages
+            try:
+                transcripts: Dict[str, List[Dict[str, Any]]] = app.state.session_transcripts
+                all_msgs = transcripts.get(session_id, [])
+                window = int(SUMMARY_WINDOW_N) if SUMMARY_WINDOW_N > 0 else 10
+                msgs = all_msgs[-window:]
+            except Exception:
+                msgs = []
+            summary_text = _build_rolling_summary_text(msgs)
+            now_ms = int(time.time() * 1000)
+            row = {"version": int(version), "updatedAt": now_ms, "summaryText": summary_text}
+            # Store in memory
+            try:
+                store: Dict[str, Dict[str, Any]] = app.state.session_summaries
+                store[session_id] = row
+            except Exception:
+                pass
+
+            # Enqueue latency metric
+            try:
+                if enq_ts:
+                    SUMMARY_ENQUEUE_LAT_SECONDS.observe(max(0.0, time.perf_counter() - enq_ts))
+            except Exception:
+                pass
+
+            # Optional persistence (write-behind)
+            try:
+                payload = {"sessionId": session_id, **row}
+                await _persist_summary_if_configured(payload)
+            except Exception:
+                pass
+
+            # Metrics: success and duration
+            try:
+                SUMMARY_JOBS_TOTAL.labels(status="ok").inc()
+                SUMMARY_JOB_SECONDS.observe(time.perf_counter() - t0)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            try:
+                SUMMARY_JOBS_TOTAL.labels(status="error").inc()
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
+
+
 @app.post(
     "/messages/ingest",
     tags=["messages"],
@@ -2621,6 +2797,35 @@ async def messages_ingest(request: Request):
             "content": content or "",
             "ts": ts_ms,
         })
+        # Strict every-N summarization enqueue (independent of assessments)
+        if SUMMARY_ENABLED and SUMMARY_WINDOW_N > 0:
+            try:
+                count = len(lst)
+                if count % SUMMARY_WINDOW_N == 0:
+                    version = count // SUMMARY_WINDOW_N
+                    q: asyncio.Queue = app.state.summary_queue  # type: ignore[attr-defined]
+                    enq_ts = time.perf_counter()
+                    await q.put((session_id, version, enq_ts))
+                    try:
+                        SUMMARY_QUEUE_DEPTH.set(q.qsize())
+                    except Exception:
+                        pass
+                    try:
+                        app.state.summary_enqueued_ts[session_id] = enq_ts  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    try:
+                        logger.info(json.dumps({
+                            "event": "summary_enqueued",
+                            "sessionId": session_id,
+                            "version": version,
+                            "count": count,
+                            "window": SUMMARY_WINDOW_N,
+                        }))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
     except Exception:
         # Do not fail ingestion if transcript buffering has issues
         evt_idx = -1  # sentinel
