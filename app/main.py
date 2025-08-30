@@ -127,6 +127,20 @@ if not logger.handlers:
 # Avoid double logging if root/uvicorn also handle propagation
 logger.propagate = False
 
+def _sse_data_event(text: str) -> str:
+    """
+    Encode text as a well-formed SSE data event.
+    Splits on newlines and prefixes each with 'data: ', ending with a blank line.
+    Prevents malformed events when tokens contain newlines.
+    """
+    try:
+        lines = str(text).splitlines()
+    except Exception:
+        lines = [str(text)]
+    if not lines:
+        return "data: \n\n"
+    return "".join(f"data: {line}\n" for line in lines) + "\n"
+
 # Prometheus metrics
 SQS_SEND_SECONDS = Histogram("coachup_sqs_send_seconds", "Duration of SQS send_message in seconds")
 SQS_RECEIVE_SECONDS = Histogram("coachup_sqs_receive_seconds", "Duration of SQS receive_message in seconds")
@@ -472,7 +486,7 @@ async def _token_stream():
         "Finally", ", ", "notice ", "how ", "punctuation ", "causes ", "natural ", "breaks ", "in ", "speech", ".\n",
     ]
     for token in tokens:
-        yield f"data: {token}\n\n"
+        yield _sse_data_event(token)
         await asyncio.sleep(0.15)
     yield "data: [DONE]\n\n"
 
@@ -539,11 +553,11 @@ async def chat_stream(
         try:
             # Define stub stream upfront so provider fallback can reuse it safely
             async def _stub_stream():
-                yield "data: Hello! I'm in stub mode.\n\n"
+                yield _sse_data_event("Hello! I'm in stub mode.")
                 await asyncio.sleep(0.05)
-                yield "data: Chat functionality is disabled.\n\n"
+                yield _sse_data_event("Chat functionality is disabled.")
                 await asyncio.sleep(0.05)
-                yield "data: Set AI_CHAT_ENABLED=1 to enable real chat.\n\n"
+                yield _sse_data_event("Set AI_CHAT_ENABLED=1 to enable real chat.")
                 await asyncio.sleep(0.15)
                 yield "data: [DONE]\n\n"
 
@@ -707,7 +721,7 @@ async def chat_stream(
                                 except Exception:
                                     pass
                                 # Emit a small notice and switch to stub
-                                yield f"data: [provider timeout after {int(_ttft_timeout_s)}s, falling back]\n\n"
+                                yield _sse_data_event(f"[provider timeout after {int(_ttft_timeout_s)}s, falling back]")
                                 async for chunk in _stub_stream():
                                     yield chunk
                                 return
@@ -717,7 +731,7 @@ async def chat_stream(
                                 return
 
                             # We got the first token — record metrics and yield it
-                            chunk = f"data: {first_token}\n\n"
+                            chunk = _sse_data_event(first_token)
                             if first_token_s is None:
                                 first_token_s = time.perf_counter() - start
                                 try:
@@ -749,7 +763,7 @@ async def chat_stream(
 
                             # Stream the rest
                             async for token in agen:
-                                yield f"data: {token}\n\n"
+                                yield _sse_data_event(token)
                             # End-of-stream marker
                             yield "data: [DONE]\n\n"
                         except Exception as e:
@@ -771,7 +785,7 @@ async def chat_stream(
                             except Exception:
                                 pass
                             # Emit a small notice with the error summary
-                            yield f"data: [provider runtime error: {str(e)[:240]}]\n\n"
+                            yield _sse_data_event(f"[provider runtime error: {str(e)[:240]}]")
                             async for chunk in _stub_stream():
                                 yield chunk
 

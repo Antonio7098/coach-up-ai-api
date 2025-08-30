@@ -269,23 +269,28 @@ class GoogleClassifierClient(ClassifierClient):
         user_prompt = f"{context_info}CURRENT MESSAGE:\nrole: {role}\nturnCount: {turn_count}\ncontent:\n{content}"
         
         # Build request payload for Google Generative Language API
+        # Use systemInstruction and enforce JSON response to increase parsing reliability across models (incl. Gemini 2.5 Flash)
         payload = {
             "contents": [
                 {
-                    "role": "user", 
-                    "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]
+                    "role": "user",
+                    "parts": [{"text": user_prompt}],
                 }
             ],
             "generationConfig": {
                 "temperature": 0,
                 "candidateCount": 1,
                 "maxOutputTokens": 200,
-            }
+                "responseMimeType": "application/json",
+            },
+            # v1beta supports systemInstruction as a Content object
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
         }
         
         try:
             headers = {
                 "Content-Type": "application/json",
+                "Accept": "application/json",
                 "User-Agent": "coach-up-ai-api/0.1.0",
             }
             if request_id:
@@ -321,13 +326,36 @@ class GoogleClassifierClient(ClassifierClient):
                 return {"decision": "abstain", "confidence": 0.0, "reasons": "no_parts"}
             
             content_text = parts[0].get("text", "").strip()
+            # Optional debug logging of raw content for observability (truncated)
+            try:
+                if os.getenv("GOOGLE_CLASSIFY_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on"):
+                    logging.getLogger("coach_up.ai.google").info(json.dumps({
+                        "event": "google_classify_raw",
+                        "model": model,
+                        "preview": content_text[:800],
+                    }))
+            except Exception:
+                pass
             
             # Clean up common markdown artifacts
             if content_text.startswith("```"):
+                # Remove typical fenced code blocks like ```json ... ```
                 lines = content_text.split('\n')
-                # Remove first and last lines if they contain backticks
                 if len(lines) > 2:
-                    content_text = '\n'.join(lines[1:-1])
+                    # Drop first and last lines when they are fences
+                    if lines[0].lstrip().startswith("```") and lines[-1].lstrip().startswith("```"):
+                        content_text = '\n'.join(lines[1:-1])
+                content_text = content_text.strip()
+
+            # If extra prose is around JSON, try to extract the first top-level JSON object
+            if not (content_text.startswith("{") and content_text.rstrip().endswith("}")):
+                try:
+                    start = content_text.find("{")
+                    end = content_text.rfind("}")
+                    if start != -1 and end != -1 and end > start:
+                        content_text = content_text[start:end+1]
+                except Exception:
+                    pass
             
             # Try to parse as JSON
             obj = json.loads(content_text)
