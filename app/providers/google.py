@@ -630,7 +630,8 @@ class GoogleSummaryClient(SummaryClient):
             "Do NOT restate short-term focus prompts already visible in recent messages.\n"
             "Avoid duplicating items covered earlier; deduplicate and roll-up when necessary.\n"
             "Keep headings stable (e.g., 'Covered so far', 'Scenarios tried', 'Techniques', 'Open threads').\n"
-            "If nothing substantively new occurred, return the previous summary unchanged. Keep it brief."
+            "If nothing substantively new occurred, return the previous summary unchanged. Keep it brief.\n"
+            "When constrained by token/length limits, PRIORITIZE THE MOST RECENT NEW INFORMATION and truncate older details first; preserve a coherent brief of earlier items."
         )
         user = (
             (f"Previous summary:\n{prev_summary}\n\n" if prev_summary.strip() else "") +
