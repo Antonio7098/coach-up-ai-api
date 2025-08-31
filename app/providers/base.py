@@ -50,3 +50,23 @@ class AssessClient(abc.ABC):
         skill: Optional[dict] = None,
     ) -> dict:
         ...
+
+
+class SummaryClient(abc.ABC):
+    """LLM-based session summarizer."""
+
+    provider_name: str = "unknown"
+
+    def __init__(self, model: Optional[str] = None):
+        self.model = model
+
+    @abc.abstractmethod
+    async def summarize(
+        self,
+        prev_summary: str,
+        messages: list[dict],
+        *,
+        token_budget: int | None = None,
+        request_id: Optional[str] = None,
+    ) -> str:
+        ...

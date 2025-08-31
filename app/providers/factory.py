@@ -1,8 +1,8 @@
 import os
 from typing import Optional
 
-from .base import ChatClient, ClassifierClient, AssessClient
-from .mock import MockChatClient, MockClassifierClient, MockAssessClient
+from .base import ChatClient, ClassifierClient, AssessClient, SummaryClient
+from .mock import MockChatClient, MockClassifierClient, MockAssessClient, MockSummaryClient
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -89,3 +89,21 @@ def get_assess_client(provider: Optional[str] = None, model: Optional[str] = Non
             return MockAssessClient(model=mdl)
 
     return MockAssessClient(model=mdl)
+
+
+def get_summary_client(provider: Optional[str] = None, model: Optional[str] = None) -> SummaryClient:
+    prov = (provider or _env_str("AI_PROVIDER_SUMMARY") or _env_str("AI_PROVIDER") or "mock").lower()
+    mdl = model or _env_str("AI_SUMMARY_MODEL") or _env_str("AI_CHAT_MODEL") or None
+
+    if prov in ("mock", "test"):
+        return MockSummaryClient(model=mdl)
+
+    if prov in ("google", "gemini"):
+        try:
+            from .google import GoogleSummaryClient  # type: ignore
+            return GoogleSummaryClient(model=mdl)
+        except Exception:
+            return MockSummaryClient(model=mdl)
+
+    # Fallback
+    return MockSummaryClient(model=mdl)

@@ -5,7 +5,7 @@ from typing import AsyncIterator, Optional, Any, Dict, List
 
 import httpx
 
-from .base import ChatClient, ClassifierClient, AssessClient
+from .base import ChatClient, ClassifierClient, AssessClient, SummaryClient
 
 
 class GoogleChatClient(ChatClient):
@@ -600,3 +600,61 @@ class GoogleAssessClient(AssessClient):
                 "rubricKeyPoints": ["Unable to parse assessment response"],
                 "meta": {"provider": "google", "modelId": self.model, "error": "parse_error"},
             }
+
+
+class GoogleSummaryClient(SummaryClient):
+    provider_name: str = "google"
+
+    def __init__(self, model: Optional[str] = None):
+        super().__init__(model=model or os.getenv("AI_SUMMARY_MODEL") or os.getenv("AI_CHAT_MODEL") or "gemini-1.5-flash")
+        api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("GOOGLE_API_KEY is required for Google provider")
+        self._api_key = api_key
+
+    async def summarize(self, prev_summary: str, messages: List[Dict[str, Any]], *, token_budget: Optional[int] = None, request_id: Optional[str] = None) -> str:
+        api_key = self._api_key
+        model = (self.model or "gemini-1.5-flash").strip()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+        # Compose prompt: concise rolling summary + latest messages
+        recent_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in (messages or []) if m and m.get('role') and m.get('content')])
+        system = (
+            "You are a concise session summarizer for a voice coaching app. "
+            "Write a short rolling summary capturing key context, goals, and any commitments. "
+            "Keep it actionable and brief. Avoid repeating raw dialogue."
+        )
+        user = (
+            (f"Previous summary:\n{prev_summary}\n\n" if prev_summary.strip() else "") +
+            (f"Recent messages:\n{recent_text}" if recent_text.strip() else "Recent messages: (none)")
+        )
+        gen_cfg: Dict[str, Any] = {"temperature": 0.2}
+        if token_budget and token_budget > 0:
+            # Rough cap for output
+            gen_cfg["maxOutputTokens"] = max(120, min(2048, token_budget))
+
+        payload = {
+            "contents": [
+                {"role": "user", "parts": [{"text": user}]},
+            ],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "generationConfig": gen_cfg,
+        }
+
+        headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "coach-up-ai-api/0.1.0"}
+        if request_id:
+            headers["X-Request-Id"] = request_id
+        async with httpx.AsyncClient(timeout=float(os.getenv("AI_HTTP_TIMEOUT_SECONDS") or 30)) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            if r.status_code >= 400:
+                raise RuntimeError(f"Google summarize error {r.status_code}: {r.text}")
+            data = r.json()
+        try:
+            candidates = (data or {}).get("candidates") or []
+            content = (candidates[0].get("content") or {}) if candidates else {}
+            parts = content.get("parts") or []
+            text_parts = [str(p.get("text") or "") for p in parts]
+            out = "\n".join([t for t in text_parts if t]).strip()
+            return out
+        except Exception:
+            return ""

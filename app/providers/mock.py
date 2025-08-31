@@ -1,7 +1,7 @@
 import asyncio
 from typing import AsyncIterator, Optional, Dict, Any, List
 
-from .base import ChatClient, ClassifierClient, AssessClient
+from .base import ChatClient, ClassifierClient, AssessClient, SummaryClient
 
 
 class MockChatClient(ChatClient):
@@ -67,3 +67,18 @@ class MockAssessClient(AssessClient):
             "recommendations": ["placeholder"],
             "meta": meta,
         }
+
+
+class MockSummaryClient(SummaryClient):
+    provider_name: str = "mock"
+
+    def __init__(self, model: Optional[str] = None):
+        super().__init__(model=model or "mock-summary-1")
+
+    async def summarize(self, prev_summary: str, messages: list[dict], *, token_budget: int | None = None, request_id: Optional[str] = None) -> str:
+        # Deterministic stub: prepend header and include messages
+        recent = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in (messages or []) if m and m.get('role') and m.get('content')])
+        out = (f"Summary so far:\n{prev_summary.strip()}\n\nRecent messages:\n{recent}").strip()
+        if token_budget and token_budget > 0:
+            out = out[: max(120, min(8000, token_budget * 8))]
+        return out

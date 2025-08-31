@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover - optional dependency fallback
     CONTENT_TYPE_LATEST = "text/plain"
 
 from app.middleware.request_id import RequestIdMiddleware
-from app.providers.factory import get_chat_client, get_classifier_client, get_assess_client
+from app.providers.factory import get_chat_client, get_classifier_client, get_assess_client, get_summary_client
 
 
 app = FastAPI(
@@ -660,6 +660,7 @@ async def chat_stream(
                     
                     # Debug: log exact prompt payload being sent to chat LLM (with context details)
                     try:
+                        # Always log lightweight, redacted metadata
                         logger.info(
                             json.dumps(
                                 {
@@ -669,7 +670,6 @@ async def chat_stream(
                                     "route": "/chat/stream",
                                     "provider": provider_name,
                                     "model": model_name,
-                                    "prompt": (prompt or ""),
                                     "prompt_len": len(prompt or ""),
                                     "ctx_present": bool(ctx),
                                     "ctx_source": ctx_source,
@@ -680,13 +680,15 @@ async def chat_stream(
                                 }
                             )
                         )
-                        # Debug: log full system prompt and user message content
-                        print(f"[DEBUG] AI_CHAT_ENABLED={_enabled}, AI_CHAT_MODEL={model_name}")
-                        print(f"[DEBUG] System prompt: {system_prompt}")
-                        print(f"[DEBUG] User message (infused): {infused}")
-                        logger.info(f"[DEBUG] AI_CHAT_ENABLED={_enabled}, AI_CHAT_MODEL={model_name}")
-                        logger.info(f"[DEBUG] System prompt: {system_prompt}")
-                        logger.info(f"[DEBUG] User message (infused): {infused}")
+                        # Verbose content logging only when explicitly enabled
+                        _dbg_logs = str(os.getenv("AI_CHAT_DEBUG_LOGS", "")).strip().lower() in ("1", "true", "yes", "on")
+                        if _dbg_logs:
+                            try:
+                                logger.info(f"[DEBUG] AI_CHAT_ENABLED={_enabled}, AI_CHAT_MODEL={model_name}")
+                                logger.info(f"[DEBUG] System prompt: {system_prompt}")
+                                logger.info(f"[DEBUG] User message (infused): {infused}")
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
@@ -720,8 +722,8 @@ async def chat_stream(
                                     )
                                 except Exception:
                                     pass
-                                # Emit a small notice and switch to stub
-                                yield _sse_data_event(f"[provider timeout after {int(_ttft_timeout_s)}s, falling back]")
+                                # Emit a non-audible comment notice and switch to stub
+                                yield f": provider timeout after {int(_ttft_timeout_s)}s, falling back\n\n"
                                 async for chunk in _stub_stream():
                                     yield chunk
                                 return
@@ -784,8 +786,8 @@ async def chat_stream(
                                 )
                             except Exception:
                                 pass
-                            # Emit a small notice with the error summary
-                            yield _sse_data_event(f"[provider runtime error: {str(e)[:240]}]")
+                            # Emit a non-audible comment with the error summary
+                            yield f": provider runtime error: {str(e)[:240]}\n\n"
                             async for chunk in _stub_stream():
                                 yield chunk
 
@@ -881,10 +883,12 @@ async def chat_stream(
                 except Exception:
                     system_prompt = ""
                 
-                # Debug: log full system prompt and user message content (even in stub mode)
+                # Optional verbose content logging (guarded to avoid PII in non-dev)
                 try:
-                    logger.info(f"[DEBUG] System prompt: {system_prompt}")
-                    logger.info(f"[DEBUG] User message (infused): {infused}")
+                    _dbg_logs = str(os.getenv("AI_CHAT_DEBUG_LOGS", "")).strip().lower() in ("1", "true", "yes", "on")
+                    if _dbg_logs:
+                        logger.info(f"[DEBUG] System prompt: {system_prompt}")
+                        logger.info(f"[DEBUG] User message (infused): {infused}")
                 except Exception:
                     pass
                 
@@ -896,7 +900,39 @@ async def chat_stream(
                         yield chunk
 
                 _token_stream = _stub_with_reason
-            async for chunk in _token_stream():
+            # Heartbeat wrapper to keep long-lived SSE connections alive behind proxies
+            try:
+                _hb_env = os.getenv("AI_CHAT_SSE_HEARTBEAT_SECONDS", "15")
+                _hb_s = float(_hb_env) if _hb_env is not None else 15.0
+            except Exception:
+                _hb_s = 15.0
+
+            async def _with_heartbeat(agen, interval_s: float = _hb_s):
+                """Yield from agen but emit SSE comment heartbeats every interval when idle."""
+                nxt_task = asyncio.create_task(agen.__anext__())
+                try:
+                    while True:
+                        sleep_task = asyncio.create_task(asyncio.sleep(max(0.001, float(interval_s))))
+                        done, pending = await asyncio.wait({nxt_task, sleep_task}, return_when=asyncio.FIRST_COMPLETED)
+                        if nxt_task in done:
+                            try:
+                                chunk = nxt_task.result()
+                            except StopAsyncIteration:
+                                break
+                            # Schedule next token fetch
+                            nxt_task = asyncio.create_task(agen.__anext__())
+                            yield chunk
+                        else:
+                            # Heartbeat comment (SSE ignores comment lines)
+                            yield ": ping\n\n"
+                            # Continue waiting on the same next-token task
+                finally:
+                    try:
+                        nxt_task.cancel()
+                    except Exception:
+                        pass
+
+            async for chunk in _with_heartbeat(_token_stream()):
                 if first_token_s is None:
                     first_token_s = time.perf_counter() - start
                     try:
@@ -958,7 +994,7 @@ async def chat_stream(
     if not _enabled and not provider_name:
         provider_name = "stub"
         model_name = None
-    resp = StreamingResponse(instrumented_stream(), media_type="text/event-stream")
+    resp = StreamingResponse(instrumented_stream(), media_type="text/event-stream; charset=utf-8")
     if request_id:
         # Echo for clients/proxies that want to surface it
         resp.headers["X-Request-Id"] = str(request_id)
@@ -968,7 +1004,7 @@ async def chat_stream(
     if model_name:
         resp.headers["X-Chat-Model"] = str(model_name)
     # SSE anti-buffering headers
-    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["Cache-Control"] = "no-cache, no-transform"
     resp.headers["Connection"] = "keep-alive"
     # Disable nginx proxy buffering if present
     resp.headers["X-Accel-Buffering"] = "no"
@@ -1185,6 +1221,68 @@ async def get_session_summary(sessionId: Optional[str] = Query(None, description
     etag = f"{sessionId}:{row.get('version', 0)}"
     headers = {"ETag": etag}
     return JSONResponse(row, headers=headers, status_code=200)
+
+
+@app.post(
+    "/api/v1/session-summary/generate",
+    tags=["chat"],
+    description="Generate a rolling session summary using the configured provider (e.g., Google Gemini).",
+)
+async def post_session_summary_generate(
+    request: Request,
+    body: Dict[str, Any] = Body(..., description="{ sessionId, prevSummary?, messages?, tokenBudget? }"),
+):
+    sid = str((body or {}).get("sessionId") or "").strip()
+    prev = str((body or {}).get("prevSummary") or "")
+    messages = (body or {}).get("messages") or (body or {}).get("recentMessages") or []
+    token_budget = (body or {}).get("tokenBudget")
+    try:
+        token_budget = int(token_budget) if token_budget is not None else None
+    except Exception:
+        token_budget = None
+    if not sid:
+        return JSONResponse({"error": "sessionId is required"}, status_code=400)
+
+    t0 = time.perf_counter()
+    req_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    try:
+        client = get_summary_client()
+        text = await client.summarize(prev, list(messages), token_budget=token_budget, request_id=req_id)  # type: ignore[arg-type]
+        # Persist to in-memory store for immediate GET visibility
+        try:
+            store: Dict[str, Dict[str, Any]] = app.state.session_summaries  # type: ignore[attr-defined]
+        except Exception:
+            store = {}
+        row = store.get(sid)
+        version = int((row or {}).get("version") or 0) + 1
+        now_ms = int(time.time() * 1000)
+        out = {"version": version, "updatedAt": now_ms, "summaryText": text}
+        store[sid] = out
+        try:
+            logger.info(json.dumps({
+                "event": "summary_generate",
+                "provider": getattr(client, "provider_name", "unknown"),
+                "model": getattr(client, "model", None),
+                "sessionId": sid,
+                "len": len(text or ""),
+                "durationMs": int((time.perf_counter() - t0) * 1000),
+                "requestId": req_id,
+            }))
+        except Exception:
+            pass
+        return JSONResponse({"sessionId": sid, "version": version, "updatedAt": now_ms, "text": text}, status_code=200)
+    except Exception as e:
+        try:
+            logger.error(json.dumps({
+                "event": "summary_generate_error",
+                "sessionId": sid,
+                "error": type(e).__name__,
+                "message": str(e)[:512],
+                "requestId": req_id,
+            }))
+        except Exception:
+            pass
+        return JSONResponse({"error": "summary generate failed"}, status_code=502)
 
 async def _build_system_prompt(session_id: Optional[str], *, client_skills: Optional[List[Dict[str, Any]]] = None) -> str:
     """Build system prompt with speech coaching context and user's tracked skills."""
