@@ -621,9 +621,16 @@ class GoogleSummaryClient(SummaryClient):
         recent_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in (messages or []) if m and m.get('role') and m.get('content')])
         system = (
             "You are a concise session summarizer for a voice coaching app. "
-            "Update the EXISTING summary cumulatively: refine and APPEND only when there is genuinely new, durable information (decisions, goals, commitments, progress). "
-            "Do NOT restate short-term focus or one-off instructions already obvious from recent messages. "
-            "Preserve structure; keep headings stable. If nothing durable changed, return the previous summary unchanged. Keep it brief and actionable."
+            "Maintain a cumulative CONVERSATION FLOW log — what has been covered so far and in what order — with emphasis on: \n"
+            "- Topics covered (bulleted, non-repetitive)\n"
+            "- Scenarios practiced or roleplays attempted (brief identifiers)\n"
+            "- Techniques explored (e.g., enunciation, pacing, clarity)\n"
+            "- Open threads to revisit (unresolved questions, pending drills)\n"
+            "RULES: Update the EXISTING flow by appending or refining ONLY when there is genuinely NEW conversational progress.\n"
+            "Do NOT restate short-term focus prompts already visible in recent messages.\n"
+            "Avoid duplicating items covered earlier; deduplicate and roll-up when necessary.\n"
+            "Keep headings stable (e.g., 'Covered so far', 'Scenarios tried', 'Techniques', 'Open threads').\n"
+            "If nothing substantively new occurred, return the previous summary unchanged. Keep it brief."
         )
         user = (
             (f"Previous summary:\n{prev_summary}\n\n" if prev_summary.strip() else "") +
