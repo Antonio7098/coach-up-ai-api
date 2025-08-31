@@ -631,7 +631,8 @@ class GoogleSummaryClient(SummaryClient):
             "Avoid duplicating items covered earlier; deduplicate and roll-up when necessary.\n"
             "Keep headings stable (e.g., 'Covered so far', 'Scenarios tried', 'Techniques', 'Open threads').\n"
             "If nothing substantively new occurred, return the previous summary unchanged. Keep it brief.\n"
-            "When constrained by token/length limits, PRIORITIZE THE MOST RECENT NEW INFORMATION and truncate older details first; preserve a coherent brief of earlier items."
+            "When constrained by token/length limits, PRIORITIZE THE MOST RECENT NEW INFORMATION and truncate older details first; preserve a coherent brief of earlier items.\n"
+            "Do not emit unfinished sections or dangling list markers. Only include a section if it contains at least one meaningful bullet; otherwise omit it."
         )
         user = (
             (f"Previous summary:\n{prev_summary}\n\n" if prev_summary.strip() else "") +
@@ -640,7 +641,7 @@ class GoogleSummaryClient(SummaryClient):
         gen_cfg: Dict[str, Any] = {"temperature": 0.2}
         if token_budget and token_budget > 0:
             # Rough cap for output
-            gen_cfg["maxOutputTokens"] = max(120, min(2048, token_budget))
+            gen_cfg["maxOutputTokens"] = max(300, min(2048, token_budget))
 
         payload = {
             "contents": [
