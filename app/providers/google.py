@@ -621,8 +621,9 @@ class GoogleSummaryClient(SummaryClient):
         recent_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in (messages or []) if m and m.get('role') and m.get('content')])
         system = (
             "You are a concise session summarizer for a voice coaching app. "
-            "Write a short rolling summary capturing key context, goals, and any commitments. "
-            "Keep it actionable and brief. Avoid repeating raw dialogue."
+            "Update the EXISTING summary cumulatively: refine and APPEND only when there is genuinely new, durable information (decisions, goals, commitments, progress). "
+            "Do NOT restate short-term focus or one-off instructions already obvious from recent messages. "
+            "Preserve structure; keep headings stable. If nothing durable changed, return the previous summary unchanged. Keep it brief and actionable."
         )
         user = (
             (f"Previous summary:\n{prev_summary}\n\n" if prev_summary.strip() else "") +
