@@ -1300,6 +1300,19 @@ async def post_session_summary_generate(
     t0 = time.perf_counter()
     req_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     try:
+        # Debug: log incoming request shape for session summary generation
+        try:
+            logger.info(json.dumps({
+                "event": "summary_generate_request",
+                "sessionId": sid,
+                "prevLen": len(prev or ""),
+                "messagesCount": len(list(messages) if isinstance(messages, list) else []),
+                "tokenBudget": token_budget,
+                "requestId": req_id,
+            }))
+        except Exception:
+            pass
+
         client = get_summary_client()
         text = await client.summarize(prev, list(messages), token_budget=token_budget, request_id=req_id)  # type: ignore[arg-type]
         # Persist to in-memory store for immediate GET visibility
@@ -1324,6 +1337,18 @@ async def post_session_summary_generate(
             }))
         except Exception:
             pass
+        # Optional verbose content logging (guarded by env)
+        try:
+            _dbg = str(os.getenv("AI_SUMMARY_DEBUG_LOGS", "")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            _dbg = False
+        if _dbg:
+            try:
+                logger.info(f"[DEBUG] Summary prev len={len(prev or '')}, messages={len(list(messages))}, generated len={len(text or '')}")
+                preview = (text or "")[:300].replace("\n", " ")
+                logger.info(f"[DEBUG] Summary preview: {preview}")
+            except Exception:
+                pass
         return JSONResponse({"sessionId": sid, "version": version, "updatedAt": now_ms, "text": text}, status_code=200)
     except Exception as e:
         try:
