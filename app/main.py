@@ -973,7 +973,25 @@ async def chat_stream(
                     if dbg:
                         try:
                             rendered = (f"{system_prompt}\n\n{infused}" if system_prompt else infused)
-                            payload = {"system": system_prompt, "user": infused, "rendered": rendered, "ctx_source": ctx_source}
+                            payload = {
+                                "system": system_prompt or _system_prompt_base(),
+                                "user": infused,
+                                "rendered": (f"{_system_prompt_base()}\n\n{infused}") if not system_prompt else rendered,
+                                "ctx_source": ctx_source,
+                            }
+                            yield f"event: prompt\n"
+                            yield f"data: {json.dumps(payload)}\n\n"
+                        except Exception:
+                            pass
+                    if dbg:
+                        try:
+                            rendered = (f"{system_prompt}\n\n{infused}" if system_prompt else infused)
+                            payload = {
+                                "system": system_prompt or _system_prompt_base(),
+                                "user": infused,
+                                "rendered": (f"{_system_prompt_base()}\n\n{infused}") if not system_prompt else rendered,
+                                "ctx_source": ctx_source,
+                            }
                             yield f"event: prompt\n"
                             yield f"data: {json.dumps(payload)}\n\n"
                         except Exception:
@@ -1452,9 +1470,8 @@ async def post_session_summary_generate(
             pass
         return JSONResponse({"error": "summary generate failed"}, status_code=502)
 
-async def _build_system_prompt(session_id: Optional[str], *, client_skills: Optional[List[Dict[str, Any]]] = None) -> str:
-    """Build system prompt with speech coaching context and user's tracked skills."""
-    base_prompt = (
+def _system_prompt_base() -> str:
+    return (
         "You are a concise, friendly speech coach. Your purpose is to help users improve speaking skills through short, actionable guidance and practice.\n\n"
         "Behavioral rules:\n"
         "- Greetings and small talk: reply with 1 short friendly sentence, then immediately pivot to the goal.\n"
@@ -1462,15 +1479,20 @@ async def _build_system_prompt(session_id: Optional[str], *, client_skills: Opti
         "- Default response length: at most 2–3 sentences or 5 short bullets.\n"
         "- Ask exactly one question to clarify goals or select the next focus area.\n"
         "- Only analyze speech when the user asks for analysis/feedback or after they choose a focus area.\n"
-        "- If the user hasn't specified a focus, offer 3–5 options (e.g., clarity, pacing, energy, filler words, structure).\n"
+        "- If the user hasn’t specified a focus, offer 3–5 options (e.g., clarity, pacing, energy, filler words, structure).\n"
         "- When providing guidance, prefer practical, immediately applicable tips.\n"
-        "- Avoid repeating the user's message. Avoid long explanations. Be supportive and encouraging.\n\n"
+        "- Avoid repeating the user’s message. Avoid long explanations. Be supportive and encouraging.\n\n"
         "If a focus area is chosen:\n"
         "- Provide 2–3 concise, actionable tips (or 1 micro-exercise), then ask one next-step question.\n\n"
         "If user asks for analysis:\n"
         "- Keep analysis brief (2–3 bullets), then 1–2 concrete next actions.\n\n"
         "Stay conversational, positive, and time-efficient."
     )
+
+
+async def _build_system_prompt(session_id: Optional[str], *, client_skills: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Build system prompt with speech coaching context and user's tracked skills."""
+    base_prompt = _system_prompt_base()
     
     # Add tracked skills context if available
     skills: List[Dict[str, Any]] = []
