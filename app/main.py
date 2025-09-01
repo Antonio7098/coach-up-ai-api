@@ -1312,6 +1312,36 @@ async def post_session_summary_generate(
             }))
         except Exception:
             pass
+        # Optional: emit a safe sample of inputs for diagnosis
+        try:
+            _dbg = str(os.getenv("AI_SUMMARY_DEBUG_LOGS", "")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            _dbg = False
+        if _dbg:
+            try:
+                msgs = list(messages) if isinstance(messages, list) else []
+                sample: List[Dict[str, str]] = []
+                for m in (msgs[:2] + msgs[-2:] if len(msgs) > 4 else msgs):
+                    try:
+                        role = str((m.get("role") or ""))
+                        content = str((m.get("content") or "")).replace("\n", " ")
+                        if len(content) > 200:
+                            content = content[:197] + "..."
+                        sample.append({"role": role, "content": content})
+                    except Exception:
+                        continue
+                prev_preview = (prev or "").replace("\n", " ")
+                if len(prev_preview) > 240:
+                    prev_preview = prev_preview[:237] + "..."
+                logger.info(json.dumps({
+                    "event": "summary_generate_input_sample",
+                    "requestId": req_id,
+                    "sessionId": sid,
+                    "prevPreview": prev_preview,
+                    "sampleMessages": sample,
+                }))
+            except Exception:
+                pass
 
         client = get_summary_client()
         text = await client.summarize(prev, list(messages), token_budget=token_budget, request_id=req_id)  # type: ignore[arg-type]
