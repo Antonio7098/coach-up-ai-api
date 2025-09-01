@@ -1294,6 +1294,16 @@ async def post_session_summary_generate(
         token_budget = int(token_budget) if token_budget is not None else None
     except Exception:
         token_budget = None
+    # Enforce a backend minimum/default token budget to avoid MAX_TOKENS empty outputs
+    try:
+        _min_budget = int(os.getenv("AI_SUMMARY_TOKEN_BUDGET_MIN", "1200").strip())
+    except Exception:
+        _min_budget = 1200
+    token_budget_final: Optional[int]
+    if token_budget is None:
+        token_budget_final = _min_budget
+    else:
+        token_budget_final = max(_min_budget, int(token_budget))
     if not sid:
         return JSONResponse({"error": "sessionId is required"}, status_code=400)
 
@@ -1307,7 +1317,7 @@ async def post_session_summary_generate(
                 "sessionId": sid,
                 "prevLen": len(prev or ""),
                 "messagesCount": len(list(messages) if isinstance(messages, list) else []),
-                "tokenBudget": token_budget,
+                "tokenBudget": token_budget_final,
                 "requestId": req_id,
             }))
         except Exception:
@@ -1344,7 +1354,7 @@ async def post_session_summary_generate(
                 pass
 
         client = get_summary_client()
-        text = await client.summarize(prev, list(messages), token_budget=token_budget, request_id=req_id)  # type: ignore[arg-type]
+        text = await client.summarize(prev, list(messages), token_budget=token_budget_final, request_id=req_id)  # type: ignore[arg-type]
         # Access in-memory store and current row
         try:
             store: Dict[str, Dict[str, Any]] = app.state.session_summaries  # type: ignore[attr-defined]
