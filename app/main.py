@@ -589,6 +589,8 @@ async def chat_stream(
                                     limit = 10
                                 items = arr[-max(1, min(200, limit)) :]
                                 lines: List[str] = []
+                                lines_turns: List[str] = []
+                                lines_unknown: List[str] = []
                                 # Env-configurable caps
                                 _item_word_cap = _chat_item_word_cap_default()
                                 _total_word_cap = _chat_total_word_cap_default()
@@ -607,8 +609,22 @@ async def chat_stream(
                                         _cap = max(1, int(_item_char_cap or 240))
                                         txt = (txt_raw[:max(0, _cap - 3)] + "...") if len(txt_raw) > _cap else txt_raw
                                     if txt:
-                                        lines.append(f"{tag}: {txt}")
-                                ctx = "; ".join(lines)
+                                        line = f"{tag}: {txt}"
+                                        lines.append(line)
+                                        if tag == "?":
+                                            lines_unknown.append(line)
+                                        else:
+                                            lines_turns.append(line)
+                                # Present context in sections for readability
+                                sections: List[str] = []
+                                if lines_unknown:
+                                    # Strip leading "?: " for display
+                                    unknown_fmt = ["- " + l[3:] if l.startswith("?: ") else ("- " + l) for l in lines_unknown]
+                                    sections.append("Session summary:\n" + "\n".join(unknown_fmt))
+                                if lines_turns:
+                                    turns_fmt = ["- " + l for l in lines_turns]
+                                    sections.append("Recent turns:\n" + "\n".join(turns_fmt))
+                                ctx = "\n\n".join(sections) if sections else "\n".join(["- " + l for l in lines])
                                 # Total truncation: prefer words, fallback to chars
                                 if _total_word_cap > 0:
                                     ctx = _truncate_by_words(ctx, _total_word_cap)
@@ -868,6 +884,8 @@ async def chat_stream(
                                 limit = 10
                             items = arr[-max(1, min(200, limit)) :]
                             lines: List[str] = []
+                            lines_turns: List[str] = []
+                            lines_unknown: List[str] = []
                             # Env-configurable caps
                             _item_word_cap = _chat_item_word_cap_default()
                             _total_word_cap = _chat_total_word_cap_default()
@@ -886,8 +904,21 @@ async def chat_stream(
                                     _cap = max(1, int(_item_char_cap or 240))
                                     txt = (txt_raw[:max(0, _cap - 3)] + "...") if len(txt_raw) > _cap else txt_raw
                                 if txt:
-                                    lines.append(f"{tag}: {txt}")
-                            ctx = "; ".join(lines)
+                                    line = f"{tag}: {txt}"
+                                    lines.append(line)
+                                    if tag == "?":
+                                        lines_unknown.append(line)
+                                    else:
+                                        lines_turns.append(line)
+                            # Present context in sections for readability
+                            sections: List[str] = []
+                            if lines_unknown:
+                                unknown_fmt = ["- " + l[3:] if l.startswith("?: ") else ("- " + l) for l in lines_unknown]
+                                sections.append("Session summary:\n" + "\n".join(unknown_fmt))
+                            if lines_turns:
+                                turns_fmt = ["- " + l for l in lines_turns]
+                                sections.append("Recent turns:\n" + "\n".join(turns_fmt))
+                            ctx = "\n\n".join(sections) if sections else "\n".join(["- " + l for l in lines])
                             # Total truncation: prefer words, fallback to chars
                             if _total_word_cap > 0:
                                 ctx = _truncate_by_words(ctx, _total_word_cap)
@@ -1431,9 +1462,9 @@ async def _build_system_prompt(session_id: Optional[str], *, client_skills: Opti
         "- Default response length: at most 2–3 sentences or 5 short bullets.\n"
         "- Ask exactly one question to clarify goals or select the next focus area.\n"
         "- Only analyze speech when the user asks for analysis/feedback or after they choose a focus area.\n"
-        "- If the user hasn’t specified a focus, offer 3–5 options (e.g., clarity, pacing, energy, filler words, structure).\n"
+        "- If the user hasn't specified a focus, offer 3–5 options (e.g., clarity, pacing, energy, filler words, structure).\n"
         "- When providing guidance, prefer practical, immediately applicable tips.\n"
-        "- Avoid repeating the user’s message. Avoid long explanations. Be supportive and encouraging.\n\n"
+        "- Avoid repeating the user's message. Avoid long explanations. Be supportive and encouraging.\n\n"
         "If a focus area is chosen:\n"
         "- Provide 2–3 concise, actionable tips (or 1 micro-exercise), then ask one next-step question.\n\n"
         "If user asks for analysis:\n"
