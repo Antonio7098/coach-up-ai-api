@@ -589,19 +589,33 @@ async def chat_stream(
                                     limit = 10
                                 items = arr[-max(1, min(200, limit)) :]
                                 lines: List[str] = []
+                                # Env-configurable caps
+                                _item_word_cap = _chat_item_word_cap_default()
+                                _total_word_cap = _chat_total_word_cap_default()
+                                _item_char_cap = _chat_item_char_cap_default()
+                                _total_char_cap = _chat_total_char_cap_default()
                                 for it in items:
                                     if not isinstance(it, dict):
                                         continue
                                     role = str((it.get("role") or "")).lower()
                                     tag = "u" if role == "user" else ("a" if role == "assistant" else "?")
-                                    txt = str((it.get("content") or "")).replace("\n", " ").strip()
-                                    if len(txt) > 240:
-                                        txt = txt[:237] + "..."
+                                    txt_raw = str((it.get("content") or "")).replace("\n", " ").strip()
+                                    # Per-item truncation: prefer words, fallback to chars
+                                    if _item_word_cap > 0:
+                                        txt = _truncate_by_words(txt_raw, _item_word_cap)
+                                    else:
+                                        _cap = max(1, int(_item_char_cap or 240))
+                                        txt = (txt_raw[:max(0, _cap - 3)] + "...") if len(txt_raw) > _cap else txt_raw
                                     if txt:
                                         lines.append(f"{tag}: {txt}")
                                 ctx = "; ".join(lines)
-                                if len(ctx) > 2000:
-                                    ctx = ctx[:1997] + "..."
+                                # Total truncation: prefer words, fallback to chars
+                                if _total_word_cap > 0:
+                                    ctx = _truncate_by_words(ctx, _total_word_cap)
+                                else:
+                                    _tcap = max(1, int(_total_char_cap or 6000))
+                                    if len(ctx) > _tcap:
+                                        ctx = ctx[:max(0, _tcap - 3)] + "..."
                                 if ctx:
                                     ctx_source = "client"
                         except Exception:
@@ -854,19 +868,33 @@ async def chat_stream(
                                 limit = 10
                             items = arr[-max(1, min(200, limit)) :]
                             lines: List[str] = []
+                            # Env-configurable caps
+                            _item_word_cap = _chat_item_word_cap_default()
+                            _total_word_cap = _chat_total_word_cap_default()
+                            _item_char_cap = _chat_item_char_cap_default()
+                            _total_char_cap = _chat_total_char_cap_default()
                             for it in items:
                                 if not isinstance(it, dict):
                                     continue
                                 role = str((it.get("role") or "")).lower()
                                 tag = "u" if role == "user" else ("a" if role == "assistant" else "?")
-                                txt = str((it.get("content") or "")).replace("\n", " ").strip()
-                                if len(txt) > 240:
-                                    txt = txt[:237] + "..."
+                                txt_raw = str((it.get("content") or "")).replace("\n", " ").strip()
+                                # Per-item truncation: prefer words, fallback to chars
+                                if _item_word_cap > 0:
+                                    txt = _truncate_by_words(txt_raw, _item_word_cap)
+                                else:
+                                    _cap = max(1, int(_item_char_cap or 240))
+                                    txt = (txt_raw[:max(0, _cap - 3)] + "...") if len(txt_raw) > _cap else txt_raw
                                 if txt:
                                     lines.append(f"{tag}: {txt}")
                             ctx = "; ".join(lines)
-                            if len(ctx) > 2000:
-                                ctx = ctx[:1997] + "..."
+                            # Total truncation: prefer words, fallback to chars
+                            if _total_word_cap > 0:
+                                ctx = _truncate_by_words(ctx, _total_word_cap)
+                            else:
+                                _tcap = max(1, int(_total_char_cap or 6000))
+                                if len(ctx) > _tcap:
+                                    ctx = ctx[:max(0, _tcap - 3)] + "..."
                             if ctx:
                                 ctx_source = "client"
                     except Exception:
@@ -1643,6 +1671,51 @@ def _chat_context_limit_default() -> int:
     if v > 200:
         v = 200
     return v
+
+
+def _chat_item_word_cap_default() -> int:
+    """Optional per-message word cap. 0 disables word-based item cap."""
+    try:
+        return int((os.getenv("CHAT_CONTEXT_ITEM_WORD_CAP") or "0").strip())
+    except Exception:
+        return 0
+
+
+def _chat_total_word_cap_default() -> int:
+    """Optional total context word cap. 0 disables word-based total cap."""
+    try:
+        return int((os.getenv("CHAT_CONTEXT_TOTAL_WORD_CAP") or "0").strip())
+    except Exception:
+        return 0
+
+
+def _chat_item_char_cap_default() -> int:
+    """Per-message character cap (fallback when word cap disabled)."""
+    try:
+        return int((os.getenv("CHAT_CONTEXT_ITEM_CHAR_CAP") or "240").strip())
+    except Exception:
+        return 240
+
+
+def _chat_total_char_cap_default() -> int:
+    """Total context character cap (fallback when word cap disabled)."""
+    try:
+        return int((os.getenv("CHAT_CONTEXT_TOTAL_CHAR_CAP") or "6000").strip())
+    except Exception:
+        return 6000
+
+
+def _truncate_by_words(text: str, max_words: int) -> str:
+    if max_words <= 0:
+        return text
+    try:
+        words = re.findall(r"\S+", text)
+        if len(words) <= max_words:
+            return text
+        truncated = " ".join(words[:max_words])
+        return (truncated + "...") if truncated else text
+    except Exception:
+        return text
 
 
 async def _should_persist_transcripts(session_id: Optional[str]) -> bool:
