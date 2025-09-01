@@ -630,6 +630,8 @@ class GoogleSummaryClient(SummaryClient):
             "Do NOT restate short-term focus prompts already visible in recent messages.\n"
             "Avoid duplicating items covered earlier; deduplicate and roll-up when necessary.\n"
             "Keep headings stable (e.g., 'Covered so far', 'Scenarios tried', 'Techniques', 'Open threads').\n"
+            "LIMITS: For each section, keep at most 7 bullets. If adding new bullets would exceed 7, remove bullets from the TOP (oldest) and append new bullets at the BOTTOM (newest).\n"
+            "ROLLOVER: If removed bullets contain important information, add a FIRST bullet labeled 'Rollup' that concisely merges those removed points; otherwise omit Rollup.\n"
             "If nothing substantively new occurred, return the previous summary unchanged. Keep it brief.\n"
             "When constrained by token/length limits, PRIORITIZE THE MOST RECENT NEW INFORMATION and truncate older details first; preserve a coherent brief of earlier items.\n"
             "Do not emit unfinished sections or dangling list markers. Only include a section if it contains at least one meaningful bullet; otherwise omit it."
