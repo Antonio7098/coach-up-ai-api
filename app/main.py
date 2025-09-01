@@ -701,7 +701,8 @@ async def chat_stream(
                             dbg = False
                         if dbg:
                             try:
-                                payload = {"system": system_prompt, "user": infused, "ctx_source": ctx_source}
+                                rendered = (f"{system_prompt}\n\n{infused}" if system_prompt else infused)
+                                payload = {"system": system_prompt, "user": infused, "rendered": rendered, "ctx_source": ctx_source}
                                 yield f"event: prompt\n"
                                 yield f"data: {json.dumps(payload)}\n\n"
                             except Exception:
@@ -912,7 +913,8 @@ async def chat_stream(
                         dbg = False
                     if dbg:
                         try:
-                            payload = {"system": system_prompt, "user": infused, "ctx_source": ctx_source}
+                            rendered = (f"{system_prompt}\n\n{infused}" if system_prompt else infused)
+                            payload = {"system": system_prompt, "user": infused, "rendered": rendered, "ctx_source": ctx_source}
                             yield f"event: prompt\n"
                             yield f"data: {json.dumps(payload)}\n\n"
                         except Exception:
