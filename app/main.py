@@ -496,6 +496,7 @@ async def chat_stream(
     prompt: Optional[str] = Query(None, description="Optional user prompt for logging/testing"),
     session_id: Optional[str] = Query(None, description="Optional session id to enable multi-turn context"),
     history: Optional[str] = Query(None, description="Optional base64url-encoded JSON array of messages"),
+    mock_user_data: Optional[str] = Query(None, description="Optional base64url-encoded mock user data for testing"),
 ):
     start = time.perf_counter()
     first_token_s: Optional[float] = None
@@ -653,16 +654,39 @@ async def chat_stream(
                             ctx_source = "none"
                         # Enrich with profile + goals if available
                         try:
-                            # Resolve userId from session
-                            doc = await _get_session_doc(str(sid))
-                            uid = (doc or {}).get("userId") if isinstance(doc, dict) else None
+                            # Check for mock user data first (passed from frontend in mock mode)
+                            mock_profile = None
+                            mock_goals = None
+                            if mock_user_data:
+                                try:
+                                    s = str(mock_user_data)
+                                    pad = "=" * (-len(s) % 4)
+                                    mock_decoded = base64.urlsafe_b64decode((s + pad).encode("utf-8")).decode("utf-8", errors="ignore")
+                                    mock_data = json.loads(mock_decoded)
+                                    mock_profile = mock_data.get("profile")
+                                    mock_goals = mock_data.get("goals", [])
+                                    print(f"[DEBUG] Using mock user data: profile={bool(mock_profile)}, goals={len(mock_goals) if mock_goals else 0}")
+                                except Exception as e:
+                                    print(f"[DEBUG] Failed to decode mock user data: {e}")
+
+                            # Resolve userId from session (use mock data if available, otherwise query Convex)
+                            uid = None
+                            if mock_profile:
+                                # Use mock data
+                                uid = mock_profile.get("userId")
+                            else:
+                                # Query Convex
+                                doc = await _get_session_doc(str(sid))
+                                uid = (doc or {}).get("userId") if isinstance(doc, dict) else None
+
                             if uid:
-                                prof = await _get_user_profile(str(uid))
+                                prof = mock_profile if mock_profile else await _get_user_profile(str(uid))
                                 if isinstance(prof, dict):
                                     bio = str(prof.get("bio") or "").strip()
                                     name = str(prof.get("displayName") or "").strip()
                                     user_profile_text = (f"User profile: {name}. Bio: {bio}" if bio or name else "")
-                                goals = await _list_user_goals(str(uid))
+
+                                goals = mock_goals if mock_goals else await _list_user_goals(str(uid))
                                 if isinstance(goals, list) and goals:
                                     lines = []
                                     for g in goals[:5]:
@@ -1509,11 +1533,11 @@ def _system_prompt_base() -> str:
         "- Default response length: at most 2–3 sentences or 5 short bullets.\n"
         "- Ask exactly one question to clarify goals or select the next focus area.\n"
         "- Only analyze speech when the user asks for analysis/feedback or after they choose a focus area.\n"
-        "- If the user hasn’t specified a focus, offer 3–5 options (e.g., clarity, pacing, energy, filler words, structure).\n"
+        "- If the user hasn’t specified a focus, offer 3–5 options.\n"
         "- When providing guidance, prefer practical, immediately applicable tips.\n"
-        "- Avoid repeating the user’s message. Avoid long explanations. Be supportive and encouraging.\n\n"
+        "- Avoid repeating the user’s message. Avoid long lectures. Focus on short, actionable advice. Be supportive and encouraging.\n"
         "If a focus area is chosen:\n"
-        "- Provide 2–3 concise, actionable tips (or 1 micro-exercise), then ask one next-step question.\n\n"
+        "- Suggest a short excercise to gauge progress, and then focus on one technique at a time that will provide the most value.\n"
         "If user asks for analysis:\n"
         "- Keep analysis brief (2–3 bullets), then 1–2 concrete next actions.\n\n"
         "Stay conversational, positive, and time-efficient."
