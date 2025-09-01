@@ -1315,13 +1315,31 @@ async def post_session_summary_generate(
 
         client = get_summary_client()
         text = await client.summarize(prev, list(messages), token_budget=token_budget, request_id=req_id)  # type: ignore[arg-type]
-        # Persist to in-memory store for immediate GET visibility
+        # Access in-memory store and current row
         try:
             store: Dict[str, Dict[str, Any]] = app.state.session_summaries  # type: ignore[attr-defined]
         except Exception:
             store = {}
         row = store.get(sid)
-        version = int((row or {}).get("version") or 0) + 1
+        prev_version = int((row or {}).get("version") or 0)
+        prev_updated = int((row or {}).get("updatedAt") or 0)
+        # If model returned empty text, make it explicit and avoid persisting empty
+        if not (text or "").strip():
+            try:
+                logger.info(json.dumps({
+                    "event": "summary_generate_empty",
+                    "provider": getattr(client, "provider_name", "unknown"),
+                    "model": getattr(client, "model", None),
+                    "sessionId": sid,
+                    "prevVersion": prev_version,
+                    "requestId": req_id,
+                }))
+            except Exception:
+                pass
+            payload = {"sessionId": sid, "status": "empty", "version": prev_version, "updatedAt": prev_updated, "text": ""}
+            return JSONResponse(payload, status_code=200, headers={"X-Summary-Empty": "1"})
+        # Persist to in-memory store for immediate GET visibility
+        version = prev_version + 1
         now_ms = int(time.time() * 1000)
         out = {"version": version, "updatedAt": now_ms, "summaryText": text}
         store[sid] = out
