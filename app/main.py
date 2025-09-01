@@ -694,6 +694,18 @@ async def chat_stream(
 
                     async def _provider_stream():
                         nonlocal first_token_s
+                        # Emit prompt event for debugging when requested
+                        try:
+                            dbg = str(request.query_params.get("debug") or "").strip() in ("1", "true", "yes", "on") or str(os.getenv("AI_CHAT_PROMPT_EVENT", "")).strip().lower() in ("1", "true", "yes", "on")
+                        except Exception:
+                            dbg = False
+                        if dbg:
+                            try:
+                                payload = {"system": system_prompt, "user": infused, "ctx_source": ctx_source}
+                                yield f"event: prompt\n"
+                                yield f"data: {json.dumps(payload)}\n\n"
+                            except Exception:
+                                pass
                         # Implement TTFT timeout: if the first token takes too long, fall back to stub
                         try:
                             try:
@@ -893,6 +905,18 @@ async def chat_stream(
                     pass
                 
                 async def _stub_with_reason():
+                    # Emit prompt event for debugging when requested
+                    try:
+                        dbg = str(request.query_params.get("debug") or "").strip() in ("1", "true", "yes", "on") or str(os.getenv("AI_CHAT_PROMPT_EVENT", "")).strip().lower() in ("1", "true", "yes", "on")
+                    except Exception:
+                        dbg = False
+                    if dbg:
+                        try:
+                            payload = {"system": system_prompt, "user": infused, "ctx_source": ctx_source}
+                            yield f"event: prompt\n"
+                            yield f"data: {json.dumps(payload)}\n\n"
+                        except Exception:
+                            pass
                     if provider_setup_error:
                         yield f"data: [provider setup error: {provider_setup_error}]\n\n"
                         await asyncio.sleep(0.01)

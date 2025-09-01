@@ -45,3 +45,4 @@ def test_generate_then_get_mock_provider(monkeypatch: pytest.MonkeyPatch, client
     assert "Summary" in data2.get("summaryText", "") or len(data2.get("summaryText", "")) > 0
 
 
+
