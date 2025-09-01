@@ -568,7 +568,7 @@ async def chat_stream(
                     client = client_outer or get_chat_client(model=_model)
                     provider_name = getattr(client, "provider_name", None) or "unknown"
                     model_name = getattr(client, "model", None)
-                    # Build context from client-passed history when available; otherwise fallback to server transcripts.
+                    # Build context from client-passed history when available; otherwise fallback to server transcripts and user profile/goals.
                     # Accept both "sessionId" and "session_id" query keys for flexibility
                     sid = session_id or request.query_params.get("session_id") or request.query_params.get("sessionId")
                     ctx = ""
@@ -637,6 +637,8 @@ async def chat_stream(
                         except Exception:
                             pass
                     # Fallback to server-side transcript summary when client history not present/invalid (with timeout)
+                    user_profile_text = ""
+                    goals_text = ""
                     if not ctx and sid:
                         try:
                             _timeout_s = float(os.getenv("AI_CHAT_PROMPT_TIMEOUT_SECONDS", "2.0"))
@@ -649,7 +651,35 @@ async def chat_stream(
                         except Exception:
                             ctx = ""
                             ctx_source = "none"
-                    infused = (f"ctx: {ctx}\nmsg: {prompt or ''}" if ctx else (prompt or ""))
+                        # Enrich with profile + goals if available
+                        try:
+                            # Resolve userId from session
+                            doc = await _get_session_doc(str(sid))
+                            uid = (doc or {}).get("userId") if isinstance(doc, dict) else None
+                            if uid:
+                                prof = await _get_user_profile(str(uid))
+                                if isinstance(prof, dict):
+                                    bio = str(prof.get("bio") or "").strip()
+                                    name = str(prof.get("displayName") or "").strip()
+                                    user_profile_text = (f"User profile: {name}. Bio: {bio}" if bio or name else "")
+                                goals = await _list_user_goals(str(uid))
+                                if isinstance(goals, list) and goals:
+                                    lines = []
+                                    for g in goals[:5]:
+                                        t = str((g or {}).get("title") or "").strip()
+                                        st = str((g or {}).get("status") or "").strip()
+                                        if t:
+                                            lines.append(f"- {t}{(' ['+st+']') if st else ''}")
+                                    if lines:
+                                        goals_text = "User goals:\n" + "\n".join(lines)
+                        except Exception:
+                            user_profile_text = ""
+                            goals_text = ""
+                    infused_ctx = ctx
+                    if user_profile_text or goals_text:
+                        ext = "\n\n".join(s for s in [user_profile_text, goals_text] if s)
+                        infused_ctx = (f"{ctx}\n\n{ext}" if ctx else ext)
+                    infused = (f"ctx: {infused_ctx}\nmsg: {prompt or ''}" if infused_ctx else (prompt or ""))
                     
                     # Build system prompt with speech coaching context and tracked skills (with timeout)
                     try:
@@ -1784,6 +1814,31 @@ async def _get_session_doc(session_id: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return None
+
+
+async def _get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch user profile from Convex (displayName, email, avatarUrl, bio)."""
+    try:
+        data = await _convex_query("functions/users:getProfile", {"userId": user_id})
+        if isinstance(data, dict):
+            # Convex HTTP shape: { status, value }
+            val = data.get("value") if data.get("status") != "error" else None
+            return val if isinstance(val, dict) else None
+    except Exception:
+        return None
+    return None
+
+
+async def _list_user_goals(user_id: str) -> List[Dict[str, Any]]:
+    """Fetch user goals from Convex; returns a list of goals (title, status, etc.)."""
+    try:
+        data = await _convex_query("functions/users:listGoals", {"userId": user_id})
+        if isinstance(data, dict):
+            val = data.get("value") if data.get("status") != "error" else None
+            return val if isinstance(val, list) else []
+    except Exception:
+        return []
+    return []
 
 
 def _sha256_hex(s: str) -> str:
