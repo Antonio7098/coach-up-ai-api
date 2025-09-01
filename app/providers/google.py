@@ -659,12 +659,51 @@ class GoogleSummaryClient(SummaryClient):
             if r.status_code >= 400:
                 raise RuntimeError(f"Google summarize error {r.status_code}: {r.text}")
             data = r.json()
+        # Debug/telemetry: capture response meta to explain empty outputs
         try:
+            try:
+                _dbg = str(os.getenv("AI_SUMMARY_DEBUG_LOGS", "")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                _dbg = False
+            cands_meta = []
+            for c in (data or {}).get("candidates", []) or []:
+                try:
+                    finish = c.get("finishReason") or c.get("finish_reason")
+                    safety = c.get("safetyRatings") or c.get("safety")
+                    parts = ((c.get("content") or {}).get("parts") or [])
+                    text_len = sum(len(str(p.get("text") or "")) for p in parts)
+                    cands_meta.append({"finish": finish, "textLen": text_len, "safety": safety})
+                except Exception:
+                    continue
+            # Always emit compact meta; full content only under debug flag
+            from app.main import logger  # lazy import to avoid circular at module import time
+            try:
+                logger.info(json.dumps({
+                    "event": "google_summary_response_meta",
+                    "provider": "google",
+                    "model": model,
+                    "requestId": request_id,
+                    "candidates": cands_meta,
+                }))
+            except Exception:
+                pass
             candidates = (data or {}).get("candidates") or []
             content = (candidates[0].get("content") or {}) if candidates else {}
             parts = content.get("parts") or []
             text_parts = [str(p.get("text") or "") for p in parts]
             out = "\n".join([t for t in text_parts if t]).strip()
+            if not out:
+                try:
+                    logger.info(json.dumps({
+                        "event": "google_summary_empty",
+                        "provider": "google",
+                        "model": model,
+                        "requestId": request_id,
+                        "finish": (cands_meta[0].get("finish") if cands_meta else None),
+                        "safety": (cands_meta[0].get("safety") if cands_meta else None),
+                    }))
+                except Exception:
+                    pass
             return out
         except Exception:
             return ""
