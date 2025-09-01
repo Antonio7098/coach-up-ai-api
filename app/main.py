@@ -505,6 +505,9 @@ async def chat_stream(
 
     # Try to obtain request id from middleware or header
     request_id = getattr(getattr(request, "state", object()), "request_id", None) or request.headers.get("x-request-id")
+
+    # Debug: log incoming parameters
+    logger.info(f"[DEBUG] chat_stream called with: prompt={bool(prompt)}, session_id={bool(session_id)}, history={bool(history)}, mock_user_data={bool(mock_user_data)}")
     # Also obtain hashed tracked skill id for observability
     tracked_hash = getattr(getattr(request, "state", object()), "tracked_skill_id_hash", None)
     if not tracked_hash:
@@ -665,9 +668,9 @@ async def chat_stream(
                                     mock_data = json.loads(mock_decoded)
                                     mock_profile = mock_data.get("profile")
                                     mock_goals = mock_data.get("goals", [])
-                                    print(f"[DEBUG] Using mock user data: profile={bool(mock_profile)}, goals={len(mock_goals) if mock_goals else 0}")
+                                    logger.info(f"[DEBUG] Using mock user data: profile={bool(mock_profile)}, goals={len(mock_goals) if mock_goals else 0}")
                                 except Exception as e:
-                                    print(f"[DEBUG] Failed to decode mock user data: {e}")
+                                    logger.error(f"[DEBUG] Failed to decode mock user data: {e}")
 
                             # Resolve userId from session (use mock data if available, otherwise query Convex)
                             uid = None
@@ -738,7 +741,46 @@ async def chat_stream(
                                         client_skills = norm
                         except Exception:
                             client_skills = None
-                        system_prompt = await asyncio.wait_for(_build_system_prompt(sid, client_skills=client_skills), timeout=_timeout_s)
+
+                        # Extract user profile and goals from request parameters
+                        user_profile: Optional[Dict[str, Any]] = None
+                        user_goals: Optional[List[Dict[str, Any]]] = None
+
+                        # Extract user profile (base64url JSON object)
+                        try:
+                            profile_b64 = request.query_params.get("userProfile")
+                            if profile_b64:
+                                s = str(profile_b64)
+                                pad = "=" * (-len(s) % 4)
+                                decoded = base64.urlsafe_b64decode((s + pad).encode("utf-8")).decode("utf-8", errors="ignore")
+                                profile_data = json.loads(decoded)
+                                if isinstance(profile_data, dict):
+                                    user_profile = profile_data
+                        except Exception:
+                            user_profile = None
+
+                        # Extract user goals (base64url JSON array)
+                        try:
+                            goals_b64 = request.query_params.get("userGoals")
+                            if goals_b64:
+                                s = str(goals_b64)
+                                pad = "=" * (-len(s) % 4)
+                                decoded = base64.urlsafe_b64decode((s + pad).encode("utf-8")).decode("utf-8", errors="ignore")
+                                goals_data = json.loads(decoded)
+                                if isinstance(goals_data, list):
+                                    user_goals = goals_data
+                        except Exception:
+                            user_goals = None
+
+                        system_prompt = await asyncio.wait_for(
+                            _build_system_prompt(
+                                sid,
+                                client_skills=client_skills,
+                                user_profile=user_profile,
+                                user_goals=user_goals
+                            ),
+                            timeout=_timeout_s
+                        )
                     except Exception:
                         system_prompt = ""
                     
@@ -1544,10 +1586,42 @@ def _system_prompt_base() -> str:
     )
 
 
-async def _build_system_prompt(session_id: Optional[str], *, client_skills: Optional[List[Dict[str, Any]]] = None) -> str:
-    """Build system prompt with speech coaching context and user's tracked skills."""
+async def _build_system_prompt(
+    session_id: Optional[str],
+    *,
+    client_skills: Optional[List[Dict[str, Any]]] = None,
+    user_profile: Optional[Dict[str, Any]] = None,
+    user_goals: Optional[List[Dict[str, Any]]] = None
+) -> str:
+    """Build system prompt with speech coaching context, user profile, goals, and tracked skills."""
     base_prompt = _system_prompt_base()
-    
+
+    # Add user profile context if available
+    if user_profile and isinstance(user_profile, dict):
+        display_name = str(user_profile.get("displayName") or "").strip()
+        bio = str(user_profile.get("bio") or "").strip()
+        if display_name or bio:
+            profile_parts = []
+            if display_name:
+                profile_parts.append(f"Name: {display_name}")
+            if bio:
+                profile_parts.append(f"Bio: {bio}")
+            if profile_parts:
+                profile_text = " | ".join(profile_parts)
+                base_prompt += f"User Profile: {profile_text}\n"
+
+    # Add user goals context if available
+    if user_goals and isinstance(user_goals, list) and user_goals:
+        goal_titles = []
+        for goal in user_goals:
+            if isinstance(goal, dict):
+                title = str(goal.get("title") or "").strip()
+                if title:
+                    goal_titles.append(title)
+        if goal_titles:
+            goals_text = ", ".join(goal_titles)
+            base_prompt += f"User Goals: {goals_text}\n"
+
     # Add tracked skills context if available
     skills: List[Dict[str, Any]] = []
     # Prefer client-provided skills to avoid extra round-trips
