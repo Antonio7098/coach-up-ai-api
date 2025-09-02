@@ -74,6 +74,11 @@ app.add_middleware(
 )
 app.add_middleware(RequestIdMiddleware)
 
+# Root route for health check
+@app.get("/")
+async def root():
+    return {"message": "Coach Up AI API is running", "status": "healthy"}
+
 # HTTP metrics middleware
 @app.middleware("http")
 async def _http_metrics_middleware(request: Request, call_next):
