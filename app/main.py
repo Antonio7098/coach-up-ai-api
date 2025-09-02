@@ -497,6 +497,7 @@ async def chat_stream(
     session_id: Optional[str] = Query(None, description="Optional session id to enable multi-turn context"),
     history: Optional[str] = Query(None, description="Optional base64url-encoded JSON array of messages"),
     mock_user_data: Optional[str] = Query(None, description="Optional base64url-encoded mock user data for testing"),
+    model: Optional[str] = Query(None, description="Optional model override for this request"),
 ):
     start = time.perf_counter()
     first_token_s: Optional[float] = None
@@ -507,7 +508,7 @@ async def chat_stream(
     request_id = getattr(getattr(request, "state", object()), "request_id", None) or request.headers.get("x-request-id")
 
     # Debug: log incoming parameters
-    logger.info(f"[DEBUG] chat_stream called with: prompt={bool(prompt)}, session_id={bool(session_id)}, history={bool(history)}, mock_user_data={bool(mock_user_data)}")
+    logger.info(f"[DEBUG] chat_stream called with: prompt={bool(prompt)}, session_id={bool(session_id)}, history={bool(history)}, mock_user_data={bool(mock_user_data)}, model={model}")
     # Also obtain hashed tracked skill id for observability
     tracked_hash = getattr(getattr(request, "state", object()), "tracked_skill_id_hash", None)
     if not tracked_hash:
@@ -519,10 +520,11 @@ async def chat_stream(
 
     # Provider selection (env-gated)
     _enabled = os.getenv("AI_CHAT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
-    _model = os.getenv("AI_CHAT_MODEL", "").strip() or None
-    
+    # Use request model if provided, otherwise fall back to env var
+    _model = (model or os.getenv("AI_CHAT_MODEL", "").strip()) or None
+
     # Debug: log provider configuration
-    logger.info(f"[DEBUG] AI_CHAT_ENABLED={_enabled}, AI_CHAT_MODEL={_model}")
+    logger.info(f"[DEBUG] AI_CHAT_ENABLED={_enabled}, AI_CHAT_MODEL={_model}, request_model={model}")
 
     # Pre-resolve provider/model so we can emit reliable headers on the response
     client_outer = None
@@ -850,6 +852,18 @@ async def chat_stream(
                                 yield f"data: {json.dumps(payload)}\n\n"
                             except Exception:
                                 pass
+
+                        # Emit model event to inform frontend which model was used
+                        try:
+                            model_info = {
+                                "provider": provider_name or "unknown",
+                                "model": model_name or "unknown",
+                                "requested_model": model or None
+                            }
+                            yield f"event: model\n"
+                            yield f"data: {json.dumps(model_info)}\n\n"
+                        except Exception:
+                            pass
                         # Implement TTFT timeout: if the first token takes too long, fall back to stub
                         try:
                             try:

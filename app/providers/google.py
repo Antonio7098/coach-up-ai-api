@@ -50,6 +50,9 @@ class GoogleChatClient(ChatClient):
         """
         api_key = self._api_key
         model = (self.model or "gemini-1.5-pro").strip()
+        # Strip provider prefix if present (e.g., "google/gemini-2.5-flash-lite" -> "gemini-2.5-flash-lite")
+        if "/" in model:
+            model = model.split("/", 1)[1]
         base_url = "https://generativelanguage.googleapis.com/v1beta"
         url = f"{base_url}/models/{model}:streamGenerateContent?key={api_key}"
 
@@ -313,6 +316,9 @@ class GoogleClassifierClient(ClassifierClient):
         """LLM-based classifier using Google Gemini to detect speech practice and skill improvement content."""
         api_key = self._api_key
         model = (self.model or "gemini-1.5-flash").strip()
+        # Strip provider prefix if present (e.g., "google/gemini-2.5-flash-lite" -> "gemini-2.5-flash-lite")
+        if "/" in model:
+            model = model.split("/", 1)[1]
         base_url = "https://generativelanguage.googleapis.com/v1beta"
         url = f"{base_url}/models/{model}:generateContent?key={api_key}"
         
@@ -511,7 +517,11 @@ class GoogleAssessClient(AssessClient):
           - recommendations: List[str]
           - meta: Dict[str, Any] (optional)
         """
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        model = self.model.strip() if self.model else "gemini-1.5-flash"
+        # Strip provider prefix if present (e.g., "google/gemini-2.5-flash-lite" -> "gemini-2.5-flash-lite")
+        if "/" in model:
+            model = model.split("/", 1)[1]
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "coach-up-ai-api/0.1.0 (+https://github.com/)",
@@ -718,6 +728,9 @@ class GoogleSummaryClient(SummaryClient):
     async def summarize(self, prev_summary: str, messages: List[Dict[str, Any]], *, token_budget: Optional[int] = None, request_id: Optional[str] = None) -> str:
         api_key = self._api_key
         model = (self.model or "gemini-1.5-flash").strip()
+        # Strip provider prefix if present (e.g., "google/gemini-2.5-flash-lite" -> "gemini-2.5-flash-lite")
+        if "/" in model:
+            model = model.split("/", 1)[1]
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
 
         # Compose prompt: concise rolling summary + latest messages
