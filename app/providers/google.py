@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import asyncio
 from typing import AsyncIterator, Optional, Any, Dict, List
 
 import httpx
@@ -18,6 +19,28 @@ class GoogleChatClient(ChatClient):
             raise RuntimeError("GOOGLE_API_KEY is required for Google provider")
         # TODO(SPR-005): initialize google generative ai client with api_key
         self._api_key = api_key
+
+        # Network error tracking for observability
+        self._network_errors = 0
+        self._total_requests = 0
+
+    def _log_network_health(self, request_id: Optional[str] = None):
+        """Log network health metrics periodically"""
+        self._total_requests += 1
+        if self._total_requests % 10 == 0:  # Log every 10 requests
+            error_rate = (self._network_errors / self._total_requests) * 100
+            try:
+                health_logger = logging.getLogger("coach_up.ai.google")
+                health_logger.info(json.dumps({
+                    "event": "google_network_health",
+                    "total_requests": self._total_requests,
+                    "network_errors": self._network_errors,
+                    "error_rate_percent": round(error_rate, 2),
+                    "model": self.model,
+                    "request_id": request_id,
+                }))
+            except Exception:
+                pass
 
     async def stream_chat(self, prompt: str, system: Optional[str] = None, request_id: Optional[str] = None) -> AsyncIterator[str]:
         """Stream chat tokens using Google Generative Language API (Gemini).
@@ -54,11 +77,25 @@ class GoogleChatClient(ChatClient):
         except Exception:
             pass
 
-        # Timeout configuration (seconds)
+        # Timeout configuration (seconds) - more granular for better network resilience
         try:
-            timeout_s = float(os.getenv("AI_HTTP_TIMEOUT_SECONDS") or 30)
+            connect_timeout = float(os.getenv("AI_HTTP_CONNECT_TIMEOUT_SECONDS") or 10)
+            read_timeout = float(os.getenv("AI_HTTP_READ_TIMEOUT_SECONDS") or 30)
+            write_timeout = float(os.getenv("AI_HTTP_WRITE_TIMEOUT_SECONDS") or 30)
+            pool_timeout = float(os.getenv("AI_HTTP_POOL_TIMEOUT_SECONDS") or 10)
+            timeout_s = httpx.Timeout(
+                connect=connect_timeout,
+                read=read_timeout,
+                write=write_timeout,
+                pool=pool_timeout
+            )
         except Exception:
-            timeout_s = 30.0
+            timeout_s = httpx.Timeout(
+                connect=10.0,
+                read=30.0,
+                write=30.0,
+                pool=10.0
+            )
 
         headers = {
             "Content-Type": "application/json",
@@ -72,71 +109,154 @@ class GoogleChatClient(ChatClient):
         logger = logging.getLogger("coach_up.ai.google")
 
         async with httpx.AsyncClient(timeout=timeout_s) as client:
-            try:
-                async with client.stream("POST", url, headers=headers, json=payload) as resp:
-                    if resp.status_code >= 400:
-                        raw = await resp.aread()
-                        body = raw[:1024]
-                        try:
-                            logger.error(
-                                json.dumps({
-                                    "event": "google_stream_http_error",
-                                    "status": resp.status_code,
-                                    "headers": dict(resp.headers),
-                                    "body": body.decode(errors="replace"),
-                                    "model": model,
-                                })
-                            )
-                        except Exception:
-                            pass
-                        raise RuntimeError(f"Google stream error {resp.status_code}: {body!r}")
-                    had_output = False
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        if debug:
+            # Network error retry logic
+            max_retries = int(os.getenv("GOOGLE_NETWORK_RETRY_COUNT", "2"))
+            retry_delay = float(os.getenv("GOOGLE_RETRY_DELAY_SECONDS", "1.0"))
+
+            for attempt in range(max_retries + 1):
+                try:
+                    async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                        if resp.status_code >= 400:
+                            raw = await resp.aread()
+                            body = raw[:1024]
                             try:
-                                logger.info("[google.stream] raw_line=%s", (line[:512] + ("..." if len(line) > 512 else "")))
+                                logger.error(
+                                    json.dumps({
+                                        "event": "google_stream_http_error",
+                                        "status": resp.status_code,
+                                        "headers": dict(resp.headers),
+                                        "body": body.decode(errors="replace"),
+                                        "model": model,
+                                    })
+                                )
                             except Exception:
                                 pass
-                        # Some servers send SSE-style 'data: ' prefixes — strip if present
-                        if line.startswith("data: "):
-                            line = line[len("data: ") : ]
-                        # Ignore SSE control lines
-                        if line.startswith(":") or line.startswith("event:" ):
-                            continue
-                        # Each line is expected to be a JSON object chunk
-                        try:
-                            obj = json.loads(line)
-                        except Exception:
-                            # Some servers may send non-JSON keepalives; skip
-                            continue
-                        # Chunk shape per API: { candidates: [ { content: { parts: [ { text } ] } } ] }
-                        try:
-                            candidates = obj.get("candidates") or []
-                            if not candidates:
+                            raise RuntimeError(f"Google stream error {resp.status_code}: {body!r}")
+                        had_output = False
+                        async for line in resp.aiter_lines():
+                            if not line:
                                 continue
-                            content = (candidates[0].get("content") or {})
-                            parts = content.get("parts") or []
-                            for p in parts:
-                                t = (p.get("text") or "")
-                                if t:
-                                    had_output = True
-                                    yield t
-                            # If finishReason present and not "STOP", we still just stop silently
-                            # (caller controls overall stream lifecycle)
-                        except Exception:
-                            continue
-                    # If stream finished with no tokens, try non-stream fallback once
-                    if not had_output:
+                            if debug:
+                                try:
+                                    logger.info("[google.stream] raw_line=%s", (line[:512] + ("..." if len(line) > 512 else "")))
+                                except Exception:
+                                    pass
+                            # Some servers send SSE-style 'data: ' prefixes — strip if present
+                            if line.startswith("data: "):
+                                line = line[len("data: ") : ]
+                            # Ignore SSE control lines
+                            if line.startswith(":") or line.startswith("event:" ):
+                                continue
+                            # Each line is expected to be a JSON object chunk
+                            try:
+                                obj = json.loads(line)
+                            except Exception:
+                                # Some servers may send non-JSON keepalives; skip
+                                continue
+                            # Chunk shape per API: { candidates: [ { content: { parts: [ { text } ] } } ] }
+                            try:
+                                candidates = obj.get("candidates") or []
+                                if not candidates:
+                                    continue
+                                content = (candidates[0].get("content") or {})
+                                parts = content.get("parts") or []
+                                for p in parts:
+                                    t = (p.get("text") or "")
+                                    if t:
+                                        had_output = True
+                                        yield t
+                                # If finishReason present and not "STOP", we still just stop silently
+                                # (caller controls overall stream lifecycle)
+                            except Exception:
+                                continue
+                        # If stream finished with no tokens, try non-stream fallback once
+                        if not had_output:
+                            if debug:
+                                try:
+                                    logger.info("[google.stream] no streamed tokens; attempting non-stream fallback")
+                                except Exception:
+                                    pass
+                            nonstream_url = f"{base_url}/models/{model}:generateContent?key={api_key}"
+                            r = await client.post(nonstream_url, headers=headers, json=payload)
+                            if r.status_code < 400:
+                                data = r.json()
+                                candidates = (data or {}).get("candidates") or []
+                                if candidates:
+                                    content = (candidates[0].get("content") or {})
+                                    parts = content.get("parts") or []
+                                    for p in parts:
+                                        t = (p.get("text") or "")
+                                        if t:
+                                            yield t
+                                    return
+                            else:
+                                try:
+                                    logger.error(json.dumps({
+                                        "event": "google_nonstream_http_error",
+                                        "status": r.status_code,
+                                        "headers": dict(r.headers),
+                                        "body": (r.text or "")[:1024],
+                                        "model": model,
+                                    }))
+                                except Exception:
+                                    pass
+                        break  # Success, exit retry loop
+
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout) as network_error:
+                    # Network-specific errors that might be transient
+                    error_type = type(network_error).__name__
+                    is_dns_error = "name resolution" in str(network_error).lower()
+
+                    # Track network errors for health monitoring
+                    self._network_errors += 1
+
+                    try:
+                        logger.warning(json.dumps({
+                            "event": "google_network_error",
+                            "attempt": attempt + 1,
+                            "max_attempts": max_retries + 1,
+                            "error_type": error_type,
+                            "is_dns_error": is_dns_error,
+                            "error": str(network_error)[:500],
+                            "model": model,
+                            "request_id": request_id,
+                        }))
+                    except Exception:
+                        pass
+
+                    # Don't retry on the last attempt
+                    if attempt < max_retries:
                         if debug:
                             try:
-                                logger.info("[google.stream] no streamed tokens; attempting non-stream fallback")
+                                logger.info(f"[google.stream] network error, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries + 1})")
                             except Exception:
                                 pass
-                        nonstream_url = f"{base_url}/models/{model}:generateContent?key={api_key}"
-                        r = await client.post(nonstream_url, headers=headers, json=payload)
-                        if r.status_code < 400:
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 1.5  # Exponential backoff
+                        continue
+                    else:
+                        # All retries exhausted, try non-stream fallback
+                        try:
+                            if debug:
+                                try:
+                                    logger.exception(f"[google.stream] all retries exhausted, attempting non-stream fallback: {network_error}")
+                                except Exception:
+                                    pass
+                            nonstream_url = f"{base_url}/models/{model}:generateContent?key={api_key}"
+                            r = await client.post(nonstream_url, headers=headers, json=payload)
+                            if r.status_code >= 400:
+                                try:
+                                    logger.error(json.dumps({
+                                        "event": "google_fallback_http_error",
+                                        "status": r.status_code,
+                                        "headers": dict(r.headers),
+                                        "body": (r.text or "")[:1024],
+                                        "model": model,
+                                        "after_network_retries": True,
+                                    }))
+                                except Exception:
+                                    pass
+                                raise RuntimeError(f"Google generateContent error {r.status_code}: {r.text}")
                             data = r.json()
                             candidates = (data or {}).get("candidates") or []
                             if candidates:
@@ -147,53 +267,36 @@ class GoogleChatClient(ChatClient):
                                     if t:
                                         yield t
                                 return
-                        else:
+                        except Exception as fallback_error:
                             try:
                                 logger.error(json.dumps({
-                                    "event": "google_nonstream_http_error",
-                                    "status": r.status_code,
-                                    "headers": dict(r.headers),
-                                    "body": (r.text or "")[:1024],
+                                    "event": "google_fallback_failed",
+                                    "original_error": str(network_error)[:200],
+                                    "fallback_error": str(fallback_error)[:200],
                                     "model": model,
+                                    "request_id": request_id,
                                 }))
                             except Exception:
                                 pass
-            except Exception as e:
-                # Attempt non-stream fallback (single response) to salvage a reply
-                try:
-                    if debug:
-                        try:
-                            logger.exception("[google.stream] error during stream; attempting non-stream fallback: %s", e)
-                        except Exception:
                             pass
-                    nonstream_url = f"{base_url}/models/{model}:generateContent?key={api_key}"
-                    r = await client.post(nonstream_url, headers=headers, json=payload)
-                    if r.status_code >= 400:
-                        try:
-                            logger.error(json.dumps({
-                                "event": "google_fallback_http_error",
-                                "status": r.status_code,
-                                "headers": dict(r.headers),
-                                "body": (r.text or "")[:1024],
-                                "model": model,
-                            }))
-                        except Exception:
-                            pass
-                        raise RuntimeError(f"Google generateContent error {r.status_code}: {r.text}")
-                    data = r.json()
-                    candidates = (data or {}).get("candidates") or []
-                    if candidates:
-                        content = (candidates[0].get("content") or {})
-                        parts = content.get("parts") or []
-                        for p in parts:
-                            t = (p.get("text") or "")
-                            if t:
-                                yield t
-                        return
-                except Exception:
-                    pass
-                # If all fails, bubble up to let caller handle fallback
-                raise
+                        raise  # Re-raise the original network error
+
+                except Exception as e:
+                    # Non-network errors - don't retry
+                    try:
+                        logger.error(json.dumps({
+                            "event": "google_stream_error",
+                            "error_type": type(e).__name__,
+                            "error": str(e)[:500],
+                            "model": model,
+                            "request_id": request_id,
+                        }))
+                    except Exception:
+                        pass
+                    raise
+
+        # Log network health metrics
+        self._log_network_health(request_id)
 
 
 class GoogleClassifierClient(ClassifierClient):

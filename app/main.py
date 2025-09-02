@@ -1612,14 +1612,18 @@ async def _build_system_prompt(
 
     # Add user goals context if available
     if user_goals and isinstance(user_goals, list) and user_goals:
-        goal_titles = []
+        goal_descriptions = []
         for goal in user_goals:
             if isinstance(goal, dict):
                 title = str(goal.get("title") or "").strip()
+                description = str(goal.get("description") or "").strip()
                 if title:
-                    goal_titles.append(title)
-        if goal_titles:
-            goals_text = ", ".join(goal_titles)
+                    if description:
+                        goal_descriptions.append(f"{title}: {description}")
+                    else:
+                        goal_descriptions.append(title)
+        if goal_descriptions:
+            goals_text = "; ".join(goal_descriptions)
             base_prompt += f"User Goals: {goals_text}\n"
 
     # Add tracked skills context if available
@@ -2949,6 +2953,13 @@ ASSESSMENTS_BACKOFF_BASE_MS = _env_int("ASSESSMENTS_BACKOFF_BASE_MS", 200)
 # Timeouts
 ASSESS_PER_SKILL_TIMEOUT_MS = _env_int("ASSESS_PER_SKILL_TIMEOUT_MS", 8000)
 ASSESS_GROUP_TIMEOUT_MS = _env_int("ASSESS_GROUP_TIMEOUT_MS", 15000)
+
+# Network-specific timeouts for better resilience
+AI_HTTP_TIMEOUT_SECONDS = _env_int("AI_HTTP_TIMEOUT_SECONDS", 30)
+AI_HTTP_CONNECT_TIMEOUT_SECONDS = _env_int("AI_HTTP_CONNECT_TIMEOUT_SECONDS", 10)
+AI_HTTP_READ_TIMEOUT_SECONDS = _env_int("AI_HTTP_READ_TIMEOUT_SECONDS", 30)
+AI_CHAT_TTFT_TIMEOUT_SECONDS = _env_int("AI_CHAT_TTFT_TIMEOUT_SECONDS", 8)  # Increased from 5
+AI_CHAT_PROMPT_TIMEOUT_SECONDS = _env_int("AI_CHAT_PROMPT_TIMEOUT_SECONDS", 3)
 
 # Interaction/session safety guards
 # - Max turns per multi-turn interaction before we force an 'end'
