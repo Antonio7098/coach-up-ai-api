@@ -772,15 +772,32 @@ async def chat_stream(
                         except Exception:
                             user_goals = None
 
-                        system_prompt = await asyncio.wait_for(
-                            _build_system_prompt(
-                                sid,
-                                client_skills=client_skills,
-                                user_profile=user_profile,
-                                user_goals=user_goals
-                            ),
-                            timeout=_timeout_s
-                        )
+                        # Check for custom system prompt parameter
+                        custom_system_prompt = request.query_params.get("systemPrompt")
+                        if custom_system_prompt and isinstance(custom_system_prompt, str) and custom_system_prompt.strip():
+                            # Use custom prompt but still append user profile and goals context
+                            system_prompt = await asyncio.wait_for(
+                                _build_system_prompt_with_custom_base(
+                                    custom_system_prompt.strip(),
+                                    sid,
+                                    client_skills=client_skills,
+                                    user_profile=user_profile,
+                                    user_goals=user_goals
+                                ),
+                                timeout=_timeout_s
+                            )
+                            logger.info(f"Using custom system prompt with user context (length: {len(system_prompt)})")
+                        else:
+                            logger.info("Using default system prompt")
+                            system_prompt = await asyncio.wait_for(
+                                _build_system_prompt(
+                                    sid,
+                                    client_skills=client_skills,
+                                    user_profile=user_profile,
+                                    user_goals=user_goals
+                                ),
+                                timeout=_timeout_s
+                            )
                     except Exception:
                         system_prompt = ""
                     
@@ -1047,7 +1064,24 @@ async def chat_stream(
                 except Exception:
                     _timeout_s = 2.0
                 try:
-                    system_prompt = await asyncio.wait_for(_build_system_prompt(sid), timeout=_timeout_s)
+                    # Check for custom system prompt parameter
+                    custom_system_prompt = request.query_params.get("systemPrompt")
+                    if custom_system_prompt and isinstance(custom_system_prompt, str) and custom_system_prompt.strip():
+                        # Use custom prompt but still append user profile and goals context
+                        system_prompt = await asyncio.wait_for(
+                            _build_system_prompt_with_custom_base(
+                                custom_system_prompt.strip(),
+                                sid,
+                                client_skills=client_skills,
+                                user_profile=user_profile,
+                                user_goals=user_goals
+                            ),
+                            timeout=_timeout_s
+                        )
+                        logger.info(f"Using custom system prompt with user context in stub mode (length: {len(system_prompt)})")
+                    else:
+                        logger.info("Using default system prompt in stub mode")
+                        system_prompt = await asyncio.wait_for(_build_system_prompt(sid), timeout=_timeout_s)
                 except Exception:
                     system_prompt = ""
                 
@@ -1668,6 +1702,91 @@ async def _build_system_prompt(
 
     return base_prompt
 
+
+async def _build_system_prompt_with_custom_base(
+    custom_base_prompt: str,
+    session_id: Optional[str],
+    *,
+    client_skills: Optional[List[Dict[str, Any]]] = None,
+    user_profile: Optional[Dict[str, Any]] = None,
+    user_goals: Optional[List[Dict[str, Any]]] = None
+) -> str:
+    """Build system prompt using a custom base prompt but still adding user profile, goals, and tracked skills context."""
+    # Start with the custom prompt instead of the default base
+    base_prompt = custom_base_prompt
+
+    # Add a separator if the custom prompt doesn't already end with one
+    if not base_prompt.strip().endswith('\n'):
+        base_prompt += '\n'
+
+    # Add user profile context if available
+    if user_profile and isinstance(user_profile, dict):
+        display_name = str(user_profile.get("displayName") or "").strip()
+        bio = str(user_profile.get("bio") or "").strip()
+        if display_name or bio:
+            profile_parts = []
+            if display_name:
+                profile_parts.append(f"Name: {display_name}")
+            if bio:
+                profile_parts.append(f"Bio: {bio}")
+            if profile_parts:
+                profile_text = " | ".join(profile_parts)
+                base_prompt += f"User Profile: {profile_text}\n"
+
+    # Add user goals context if available
+    if user_goals and isinstance(user_goals, list) and user_goals:
+        goal_descriptions = []
+        for goal in user_goals:
+            if isinstance(goal, dict):
+                title = str(goal.get("title") or "").strip()
+                description = str(goal.get("description") or "").strip()
+                if title:
+                    if description:
+                        goal_descriptions.append(f"{title}: {description}")
+                    else:
+                        goal_descriptions.append(title)
+        if goal_descriptions:
+            goals_text = "; ".join(goal_descriptions)
+            base_prompt += f"User Goals: {goals_text}\n"
+
+    # Add tracked skills context if available
+    skills: List[Dict[str, Any]] = []
+    # Prefer client-provided skills to avoid extra round-trips
+    if client_skills and isinstance(client_skills, list):
+        skills = client_skills
+    elif session_id:
+        try:
+            skills = await _get_tracked_skills_for_session(session_id)
+        except Exception:
+            skills = []
+    if skills:
+        skill_names = [str(s.get("name") or s.get("title") or s.get("id") or "").strip() for s in skills]
+        skill_names = [n for n in skill_names if n]
+        if skill_names:
+            try:
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": "tracked_skills_resolved",
+                            "route": "/chat/stream",
+                            "session_id_present": bool(session_id),
+                            "skill_count": len(skill_names),
+                            "skill_names": skill_names,
+                            "source": "client" if client_skills else "server",
+                        }
+                    )
+                )
+            except Exception:
+                pass
+            skills_text = ", ".join(skill_names)
+            base_prompt += (
+                f"Current focus areas for this user: {skills_text}\n"
+                "These reflect the user's selected goals. Prioritize these areas when providing tips, but keep responses brief.\n\n"
+            )
+
+    return base_prompt
+
+
 @app.get("/chat/tracked-skills", tags=["chat"], description="Fetch tracked skills for a session (for client caching).")
 async def chat_tracked_skills(session_id: Optional[str] = Query(None, description="Session ID")):
     try:
@@ -2151,12 +2270,12 @@ async def _persist_interaction_if_configured(
             "role": "assistant" if role == "assistant" else "user",
             "contentHash": ch,
             "text": text,
-            "audioUrl": None,
             "ts": int(ts_ms),
         }
-        # Only include groupId when provided (Convex validator expects optional/undefined, not null)
+        # Only include optional fields when provided (Convex validator expects optional/undefined, not null)
         if group_id:
             args["groupId"] = group_id
+        # audioUrl is intentionally omitted when None to avoid Convex validation errors
         t0 = time.perf_counter()
         try:
             await _convex_mutation("functions/interactions:appendInteraction", args)
