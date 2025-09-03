@@ -17,7 +17,7 @@ class GoogleChatClient(ChatClient):
         api_key = os.getenv("GOOGLE_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("GOOGLE_API_KEY is required for Google provider")
-        # TODO(SPR-005): initialize google generative ai client with api_key
+        # Google Generative AI client initialized via REST API (no Python SDK needed)
         self._api_key = api_key
 
         # Network error tracking for observability
