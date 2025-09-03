@@ -20,8 +20,5 @@ COPY . .
 # Expose port
 EXPOSE 8080
 
-# Set environment variables
-ENV PORT=8080
-
-# Start command
-CMD ["gunicorn", "app.main:app", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8080"]
+# Start command: bind to $PORT if provided by the platform (default 8080)
+CMD ["sh", "-c", "gunicorn app.main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-8080}"]
