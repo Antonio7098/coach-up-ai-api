@@ -1,0 +1,63 @@
+services:
+  - type: web
+    name: coach-up-ai-api
+    env: docker
+    rootDir: coach-up-ai-api
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: AI_CHAT_ENABLED
+        sync: false
+      - key: AI_PROVIDER_CHAT
+        sync: false
+      - key: AI_CHAT_MODEL
+        sync: false
+      - key: SUMMARY_ENABLED
+        sync: false
+      - key: SUMMARY_WORKER_CONCURRENCY
+        sync: false
+      - key: WORKER_CONCURRENCY
+        sync: false
+      - key: ASSESSMENTS_MAX_RETRIES
+        sync: false
+      - key: ASSESSMENTS_BACKOFF_BASE_MS
+        sync: false
+      - key: ASSESS_PER_SKILL_TIMEOUT_MS
+        sync: false
+      - key: ASSESS_GROUP_TIMEOUT_MS
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: CONVEX_URL
+        sync: false
+      - key: CONVEX_TIMEOUT_SECONDS
+        sync: false
+      - key: PERSIST_TRANSCRIPTS_ENABLED
+        sync: false
+      - key: CLASSIFIER_CONTEXT_LIMIT
+        sync: false
+      - key: TTS_PROXY_URL
+        sync: false
+      - key: TTS_PROXY_AUTH
+        sync: false
+      - key: STORAGE_PROVIDER
+        sync: false
+      - key: S3_BUCKET_AUDIO
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_FORCE_PATH_STYLE
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+        sync: false
