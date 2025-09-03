@@ -20,5 +20,6 @@ COPY . .
 # Expose port
 EXPOSE 8080
 
-# Start command: bind to $PORT if provided by the platform (default 8080)
-CMD ["sh", "-c", "gunicorn app.main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-8080}"]
+# Start command: run uvicorn directly and bind to $PORT (default 8080)
+ENV PYTHONUNBUFFERED=1
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]
