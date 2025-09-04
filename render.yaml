@@ -2,12 +2,15 @@ services:
   - type: web
     name: coach-up-ai-api
     env: docker
-    rootDir: coach-up-ai-api
-    plan: starter
+    # rootDir: .   # optional when the Dockerfile is at repo root
     region: frankfurt
+    plan: starter
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      - key: LOG_LEVEL
+        value: INFO
+        sync: false
       - key: AI_CHAT_ENABLED
         sync: false
       - key: AI_PROVIDER_CHAT
@@ -57,7 +60,4 @@ services:
       - key: AWS_ACCESS_KEY_ID
         sync: false
       - key: AWS_SECRET_ACCESS_KEY
-        sync: false
-      - key: LOG_LEVEL
-        value: INFO
         sync: false
