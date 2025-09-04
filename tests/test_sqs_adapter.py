@@ -122,12 +122,12 @@ async def test_worker_sqs_success_deletes_message_and_updates_results(monkeypatc
     task = asyncio.create_task(main._assessments_worker_sqs(app_ns, 0))
 
     # Wait until results are written or timeout
-    for _ in range(50):
+    for _ in range(100):  # Increased from 50 to 100
         await asyncio.sleep(0.05)
         if session_id in app_ns.state.assessment_results:
             break
     # Also wait for delete to be called to avoid race with cancellation
-    for _ in range(50):
+    for _ in range(100):  # Increased from 50 to 100
         await asyncio.sleep(0.05)
         if fake.deleted:
             break

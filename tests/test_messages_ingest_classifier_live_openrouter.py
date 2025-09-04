@@ -1,14 +1,9 @@
 import os
 import pytest
 from fastapi.testclient import TestClient
+from unittest.mock import patch, MagicMock
 
 from app.main import app
-
-
-requires_live = pytest.mark.skipif(
-    not os.getenv("RUN_LIVE_OPENROUTER") or not os.getenv("OPENROUTER_API_KEY"),
-    reason="Live OpenRouter tests skipped (set RUN_LIVE_OPENROUTER=1 and OPENROUTER_API_KEY)",
-)
 
 
 @pytest.fixture(autouse=True)
@@ -22,11 +17,9 @@ def reset_state():
     yield
 
 
-@requires_live
-@pytest.mark.timeout(30)
-def test_live_openrouter_user_then_assistant_closing(monkeypatch: pytest.MonkeyPatch):
+def test_mock_openrouter_user_then_assistant_closing(monkeypatch: pytest.MonkeyPatch):
     """
-    Use the real OpenRouter classifier.
+    Use a mocked OpenRouter classifier.
     Flow:
     - user message should typically start/one_off an interaction
     - assistant closing cue should end and enqueue assessment (heuristic ensures end if classifier abstains)
@@ -35,7 +28,21 @@ def test_live_openrouter_user_then_assistant_closing(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("AI_CLASSIFIER_ENABLED", "1")
     monkeypatch.setenv("AI_PROVIDER_CLASSIFIER", "openrouter")
     # Optionally pin a model known to support JSON outputs
-    monkeypatch.setenv("AI_CLASSIFIER_MODEL", os.getenv("AI_CLASSIFIER_MODEL", "openai/gpt-4o-mini"))
+    monkeypatch.setenv("AI_CLASSIFIER_MODEL", "openai/gpt-4o-mini")
+    
+    # Mock the OpenRouter classifier to return predictable responses
+    with patch('app.providers.factory.get_classifier_client') as mock_get_client:
+        mock_client = MagicMock()
+        # Mock classify to return start for user message, end for assistant closing
+        async def mock_classify(role, content, turn_count):
+            if role == "user":
+                return {"decision": "start", "confidence": 0.8}
+            elif role == "assistant" and "good luck" in content.lower():
+                return {"decision": "end", "confidence": 0.9}
+            else:
+                return {"decision": "continue", "confidence": 0.7}
+        mock_client.classify = mock_classify
+        mock_get_client.return_value = mock_client
 
     session_id = "sess_live_openrouter_1"
 
@@ -78,16 +85,28 @@ def test_live_openrouter_user_then_assistant_closing(monkeypatch: pytest.MonkeyP
         assert j2.get("groupId") == gid
 
 
-@requires_live
-@pytest.mark.timeout(30)
-def test_live_openrouter_likely_one_off_or_end(monkeypatch: pytest.MonkeyPatch):
+def test_mock_openrouter_likely_one_off_or_end(monkeypatch: pytest.MonkeyPatch):
     """
     Try a prompt that often gets classified as one_off. If not, still verify
     the pipeline can end via assistant closing and enqueue an assessment.
     """
     monkeypatch.setenv("AI_CLASSIFIER_ENABLED", "1")
     monkeypatch.setenv("AI_PROVIDER_CLASSIFIER", "openrouter")
-    monkeypatch.setenv("AI_CLASSIFIER_MODEL", os.getenv("AI_CLASSIFIER_MODEL", "openai/gpt-4o-mini"))
+    monkeypatch.setenv("AI_CLASSIFIER_MODEL", "openai/gpt-4o-mini")
+    
+    # Mock the OpenRouter classifier to return predictable responses
+    with patch('app.providers.factory.get_classifier_client') as mock_get_client:
+        mock_client = MagicMock()
+        # Mock classify to return one_off for the specific test message
+        async def mock_classify(role, content, turn_count):
+            if role == "user" and "assess this single message" in content.lower():
+                return {"decision": "one_off", "confidence": 0.9}
+            elif role == "assistant" and "good luck" in content.lower():
+                return {"decision": "end", "confidence": 0.9}
+            else:
+                return {"decision": "continue", "confidence": 0.7}
+        mock_client.classify = mock_classify
+        mock_get_client.return_value = mock_client
 
     session_id = "sess_live_openrouter_2"
 
